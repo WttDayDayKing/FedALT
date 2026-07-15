@@ -68,6 +68,8 @@ pip install -r requirements.txt
 
 ### Data Preparation
 
+we use FedDPA/data/flan/dataset1
+
 Organize your data in the following structure:
 
 ```
