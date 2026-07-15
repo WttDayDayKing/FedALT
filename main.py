@@ -43,7 +43,7 @@ def train_federated(
         lr: Learning rate
     """
     all_client_scores = {client.client_id: [] for client in clients}
-    clients_checkpoints=os.path.join(result_dir,dataset,"checkpoints")
+    clients_checkpoints=os.path.join(result_dir,dataset,"checkpoints_lora")
     os.makedirs(clients_checkpoints,exist_ok=True)
     for round_idx in tqdm(range(global_rounds), desc="Global Rounds"):
         print(f"\nGlobal Round {round_idx + 1}/{global_rounds}")
@@ -178,12 +178,14 @@ def main():
     server = Server(clients_num=len(clients))
     
     # Setup file paths
+    save_dir=os.path.join(result_dir,"eval")
+    os.makedirs(save_dir, exist_ok=True)
     eval_files = {
-        client_id: f"{result_dir}/eval_client{client_id}.jsonl"
+        client_id: f"{save_dir}/eval_client{client_id}.jsonl"
         for client_id in range(len(clients))
     }
     score_files = {
-        client_id: f"{result_dir}/scores_client{client_id}.json"
+        client_id: f"{save_dir}/scores_client{client_id}.json"
         for client_id in range(len(clients))
     }
     test_files = {

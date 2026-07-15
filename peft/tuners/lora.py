@@ -267,7 +267,8 @@ class Linear(nn.Linear, LoraLayer):
         LoraLayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, merge_weights=merge_weights)
 
         if r > 0:
-            self.lora_route = nn.Linear(in_features, self.lora_num, bias=False)
+            if self.lora_num > 1:
+                self.lora_route = nn.Linear(in_features, self.lora_num, bias=False)
             if self.asymmetric:
                 self.lora_A = nn.Linear(in_features, r, bias=False)
                 for i in range(self.lora_num):
@@ -342,25 +343,30 @@ class Linear(nn.Linear, LoraLayer):
             result = F.linear(x, transpose(weight, self.fan_in_fan_out), bias=self.bias)
 
             if self.r > 0:
-                route_logits = self.lora_route(x)
-                route_weight = nn.functional.softmax(route_logits, dim=-1, dtype=torch.float32).to(result.dtype)
+                if self.lora_num > 1:
+                    route_logits = self.lora_route(x)
+                    route_weight = nn.functional.softmax(route_logits, dim=-1, dtype=torch.float32).to(result.dtype)
+                else:
+                    route_weight = None
 
                 if self.asymmetric:
                     lora_A_output = self.lora_A(self.lora_dropout(x))
                     for i in range(self.lora_num):
                         lora_B = getattr(self, f"lora_B{i}")
-                        scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
+                        if route_weight is not None:
+                            scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
                         lora_output = lora_B(lora_A_output)
-                        result = result + scaled_route * lora_output * self.scaling
+                        result = result + (scaled_route if route_weight is not None else 1.0) * lora_output * self.scaling
                 else:
                     dropped_x = self.lora_dropout(x)
                     for i in range(self.lora_num):
                         lora_A = getattr(self, f"lora_A{i}")
                         lora_B = getattr(self, f"lora_B{i}")
                         lora_A_output = lora_A(dropped_x)
-                        scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
+                        if route_weight is not None:
+                            scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
                         lora_output = lora_B(lora_A_output)
-                        result = result + scaled_route * lora_output * self.scaling
+                        result = result + (scaled_route if route_weight is not None else 1.0) * lora_output * self.scaling
 
         blcls = torch.zeros(1, dtype=result.dtype, device=result.device)[0]
         return result
@@ -411,7 +417,8 @@ if _bnb_available:
             self.lora_num = lora_nums
             self.asymmetric = asymmetric
             if r > 0:
-                self.lora_route = nn.Linear(in_features, self.lora_num, bias=False)
+                if self.lora_num > 1:
+                    self.lora_route = nn.Linear(in_features, self.lora_num, bias=False)
                 if self.asymmetric:
                     self.lora_A = nn.Linear(in_features, r, bias=False)
                     for i in range(self.lora_num):
@@ -452,46 +459,52 @@ if _bnb_available:
                     if x.dtype != torch.float32:
                         x = x.float()
 
-                    route_logits = self.lora_route(x)
-                    route_weight = nn.functional.softmax(route_logits, dim=-1, dtype=torch.float32).to(expected_dtype)
+                    if self.lora_num > 1:
+                        route_logits = self.lora_route(x)
+                        route_weight = nn.functional.softmax(route_logits, dim=-1, dtype=torch.float32).to(expected_dtype)
+                    else:
+                        route_weight = None
 
                     if self.asymmetric:
                         lora_A_output = self.lora_A(self.lora_dropout(x))
                         for i in range(self.lora_num):
                             lora_B = getattr(self, f"lora_B{i}")
-                            scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
+                            scaled_route = torch.unsqueeze(route_weight[:, :, i], -1) if route_weight is not None else None
                             lora_output = lora_B(lora_A_output)
-                            result = result + scaled_route * lora_output * self.scaling
+                            result = result + (scaled_route if scaled_route is not None else 1.0) * lora_output * self.scaling
                     else:
                         dropped_x = self.lora_dropout(x)
                         for i in range(self.lora_num):
                             lora_A = getattr(self, f"lora_A{i}")
                             lora_B = getattr(self, f"lora_B{i}")
                             lora_A_output = lora_A(dropped_x)
-                            scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
+                            scaled_route = torch.unsqueeze(route_weight[:, :, i], -1) if route_weight is not None else None
                             lora_output = lora_B(lora_A_output)
-                            result = result + scaled_route * lora_output * self.scaling
+                            result = result + (scaled_route if scaled_route is not None else 1.0) * lora_output * self.scaling
                     result = result.to(expected_dtype)
                 else:
-                    route_logits = self.lora_route(x)
-                    route_weight = nn.functional.softmax(route_logits, dim=-1, dtype=torch.float32)
+                    if self.lora_num > 1:
+                        route_logits = self.lora_route(x)
+                        route_weight = nn.functional.softmax(route_logits, dim=-1, dtype=torch.float32)
+                    else:
+                        route_weight = None
 
                     if self.asymmetric:
                         lora_A_output = self.lora_A(self.lora_dropout(x))
                         for i in range(self.lora_num):
                             lora_B = getattr(self, f"lora_B{i}")
-                            scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
+                            scaled_route = torch.unsqueeze(route_weight[:, :, i], -1) if route_weight is not None else None
                             lora_output = lora_B(lora_A_output)
-                            result = result + scaled_route * lora_output * self.scaling
+                            result = result + (scaled_route if scaled_route is not None else 1.0) * lora_output * self.scaling
                     else:
                         dropped_x = self.lora_dropout(x)
                         for i in range(self.lora_num):
                             lora_A = getattr(self, f"lora_A{i}")
                             lora_B = getattr(self, f"lora_B{i}")
                             lora_A_output = lora_A(dropped_x)
-                            scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
+                            scaled_route = torch.unsqueeze(route_weight[:, :, i], -1) if route_weight is not None else None
                             lora_output = lora_B(lora_A_output)
-                            result = result + scaled_route * lora_output * self.scaling
+                            result = result + (scaled_route if scaled_route is not None else 1.0) * lora_output * self.scaling
 
             blcls = torch.zeros(1, dtype=result.dtype, device=result.device)[0]
             return result
@@ -530,7 +543,8 @@ if _bnb_available:
             self.asymmetric = asymmetric
 
             if r > 0 and any(enable_lora):
-                self.lora_route = nn.Linear(in_features, self.lora_num, bias=False)
+                if self.lora_num > 1:
+                    self.lora_route = nn.Linear(in_features, self.lora_num, bias=False)
                 if self.asymmetric:
                     self.lora_A = nn.Linear(in_features, r * sum(enable_lora), bias=False)
                     for i in range(self.lora_num):
@@ -593,52 +607,58 @@ if _bnb_available:
                     if x.dtype != torch.float32:
                         x = x.float()
 
-                    route_logits = self.lora_route(x)
-                    route_weight = nn.functional.softmax(route_logits, dim=-1, dtype=torch.float32).to(expected_dtype)
+                    if self.lora_num > 1:
+                        route_logits = self.lora_route(x)
+                        route_weight = nn.functional.softmax(route_logits, dim=-1, dtype=torch.float32).to(expected_dtype)
+                    else:
+                        route_weight = None
 
                     if self.asymmetric:
                         lora_A_output = self.lora_A(self.lora_dropout(x))
                         after_A = lora_A_output.transpose(-2, -1)
                         for i in range(self.lora_num):
                             lora_B = getattr(self, f"lora_B{i}")
-                            scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
+                            scaled_route = torch.unsqueeze(route_weight[:, :, i], -1) if route_weight is not None else None
                             after_B = lora_B(after_A).transpose(-2, -1)
                             output = self.zero_pad(after_B).to(expected_dtype) * self.scaling
-                            result = result + scaled_route * output
+                            result = result + (scaled_route if scaled_route is not None else 1.0) * output
                     else:
                         dropped_x = self.lora_dropout(x)
                         for i in range(self.lora_num):
                             lora_A = getattr(self, f"lora_A{i}")
                             lora_B = getattr(self, f"lora_B{i}")
                             after_A = lora_A(dropped_x).transpose(-2, -1)
-                            scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
+                            scaled_route = torch.unsqueeze(route_weight[:, :, i], -1) if route_weight is not None else None
                             after_B = lora_B(after_A).transpose(-2, -1)
                             output = self.zero_pad(after_B).to(expected_dtype) * self.scaling
-                            result = result + scaled_route * output
+                            result = result + (scaled_route if scaled_route is not None else 1.0) * output
                     result = result.to(expected_dtype)
                 else:
-                    route_logits = self.lora_route(x)
-                    route_weight = nn.functional.softmax(route_logits, dim=-1, dtype=torch.float32)
+                    if self.lora_num > 1:
+                        route_logits = self.lora_route(x)
+                        route_weight = nn.functional.softmax(route_logits, dim=-1, dtype=torch.float32)
+                    else:
+                        route_weight = None
 
                     if self.asymmetric:
                         lora_A_output = self.lora_A(self.lora_dropout(x))
                         after_A = lora_A_output.transpose(-2, -1)
                         for i in range(self.lora_num):
                             lora_B = getattr(self, f"lora_B{i}")
-                            scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
+                            scaled_route = torch.unsqueeze(route_weight[:, :, i], -1) if route_weight is not None else None
                             after_B = lora_B(after_A).transpose(-2, -1)
                             output = self.zero_pad(after_B) * self.scaling
-                            result = result + scaled_route * output
+                            result = result + (scaled_route if scaled_route is not None else 1.0) * output
                     else:
                         dropped_x = self.lora_dropout(x)
                         for i in range(self.lora_num):
                             lora_A = getattr(self, f"lora_A{i}")
                             lora_B = getattr(self, f"lora_B{i}")
                             after_A = lora_A(dropped_x).transpose(-2, -1)
-                            scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
+                            scaled_route = torch.unsqueeze(route_weight[:, :, i], -1) if route_weight is not None else None
                             after_B = lora_B(after_A).transpose(-2, -1)
                             output = self.zero_pad(after_B) * self.scaling
-                            result = result + scaled_route * output
+                            result = result + (scaled_route if scaled_route is not None else 1.0) * output
 
             blcls = torch.zeros(1, dtype=result.dtype, device=result.device)[0]
             return result

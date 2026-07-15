@@ -53,19 +53,23 @@ def main():
             prompter,
             model_name, 
             rank=args.rank, 
-            lora_n=2, 
+            lora_n=1, 
             asymmetric=False
         ))
+
+    save_dir=os.path.join(result_dir,"eval")
+    os.makedirs(save_dir, exist_ok=True)
+
     test_files = {
         client_id: os.path.join(data_path, "test", f"local_testing_{client_id}.jsonl")
         for client_id in range(len(clients))
     }
     eval_files = {
-        client_id: f"{result_dir}/eval_client{client_id}.jsonl"
+        client_id: f"{save_dir}/eval_client{client_id}_fedavg.jsonl"
         for client_id in range(len(clients))
     }
     score_files = {
-        client_id: f"{result_dir}/scores_client{client_id}.json"
+        client_id: f"{save_dir}/scores_client{client_id}_fedavg.json"
         for client_id in range(len(clients))
     }
 
@@ -74,7 +78,7 @@ def main():
         lora_path=os.path.join(lora_dir,f"client_{client.client_id}.pt")
         client.load_model()
         client.load_params(lora_path)
-        # client.evaluate_model(test_files[client.client_id], eval_files[client.client_id])
+        client.evaluate_model(test_files[client.client_id], eval_files[client.client_id])
         scores=client.calculate_rouge_scores(test_files[client.client_id], eval_files[client.client_id],score_files[client.client_id])
         print(scores)
 
