@@ -20,6 +20,17 @@
 __version__ = "0.3.0.dev0"
 
 from .mapping import MODEL_TYPE_TO_PEFT_MODEL_MAPPING, PEFT_TYPE_TO_CONFIG_MAPPING, get_peft_config, get_peft_model
+# PeftMixedModel is needed by transformers trainer; make it conditionally available
+try:
+    from .mixed_model import PeftMixedModel
+except ImportError:
+    class PeftMixedModel:
+        """Placeholder: Mixed adapter types not available in this build."""
+        def __init__(self, *args, **kwargs):
+            raise ImportError("PeftMixedModel is not available in this custom FedALT PEFT build.")
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            raise ImportError("PeftMixedModel is not available in this custom FedALT PEFT build.")
 from .peft_model import (
     PeftModel,
     PeftModelForCausalLM,

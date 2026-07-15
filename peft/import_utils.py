@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
-
-
+import packaging.version
+import transformers
+is_transformers_le_4_53 = packaging.version.parse(transformers.__version__) < packaging.version.parse("4.54.0.dev0")
 def is_bnb_available():
     return importlib.util.find_spec("bitsandbytes") is not None

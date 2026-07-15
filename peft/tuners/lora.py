@@ -32,8 +32,15 @@ def is_bnb_available():
     return importlib.util.find_spec("bitsandbytes") is not None
 
 
-if is_bnb_available():
-    import bitsandbytes as bnb
+_bnb_available = is_bnb_available()
+if _bnb_available:
+    try:
+        import bitsandbytes as bnb
+    except (ImportError, AttributeError, RuntimeError):
+        bnb = None
+        _bnb_available = False
+else:
+    bnb = None
 
 @dataclass
 class LoraConfig(PeftConfig):
@@ -123,10 +130,10 @@ class LoraModel(torch.nn.Module):
                 bias = target.bias is not None
 
                 # Handle 8-bit quantization
-                if loaded_in_8bit and isinstance(target, bnb.nn.Linear8bitLt):
+                if loaded_in_8bit and _bnb_available and isinstance(target, bnb.nn.Linear8bitLt):
                     kwargs.update({
                         "has_fp16_weights": target.state.has_fp16_weights,
-                        "memory_efficient_backward": target.state.memory_efficient_backward,
+                        "memory_efficient_backward": getattr(target.state, 'memory_efficient_backward', False),
                         "threshold": target.state.threshold,
                         "index": target.index,
                     })
@@ -146,7 +153,7 @@ class LoraModel(torch.nn.Module):
                             **kwargs
                         )
 
-                elif loaded_in_4bit and isinstance(target, bnb.nn.Linear4bit):
+                elif loaded_in_4bit and _bnb_available and isinstance(target, bnb.nn.Linear4bit):
                     kwargs.update({
                         "compute_dtype": target.compute_dtype,
                         "compress_statistics": target.weight.compress_statistics,
@@ -249,16 +256,16 @@ class Linear(nn.Linear, LoraLayer):
         asymmetric: bool = True,
         **kwargs,
     ):
-        self.r = r  
+        self.r = r
         self.lora_alpha = lora_alpha
         self.lora_num = lora_nums
         self.asymmetric = asymmetric
         self.fan_in_fan_out = fan_in_fan_out
-        
+
         nn.Linear.__init__(self, in_features, out_features, **kwargs)
-        
+
         LoraLayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, merge_weights=merge_weights)
-        
+
         if r > 0:
             self.lora_route = nn.Linear(in_features, self.lora_num, bias=False)
             if self.asymmetric:
@@ -271,16 +278,16 @@ class Linear(nn.Linear, LoraLayer):
                     setattr(self, f"lora_B{i}", nn.Linear(r, out_features, bias=False))
             self.scaling = self.lora_alpha / self.r
             self.weight.requires_grad = False
-        
+
         self.reset_parameters()
 
         if fan_in_fan_out:
             self.weight.data = self.weight.data.T
 
     def reset_parameters(self):
-        nn.Linear.reset_parameters(self)  
-        
-        if hasattr(self, 'r') and self.r > 0: 
+        nn.Linear.reset_parameters(self)
+
+        if hasattr(self, 'r') and self.r > 0:
             if self.asymmetric:
                 if hasattr(self, "lora_A"):
                     nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
@@ -375,263 +382,263 @@ def mark_only_lora_as_trainable(model: nn.Module, bias: str = "none") -> None:
                 m.bias.requires_grad = True
     else:
         raise NotImplementedError
-        
 
-class Linear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
-    def __init__(
-        self,
-        in_features,
-        out_features,
-        r: int = 0,
-        lora_alpha: int = 1,
-        lora_nums: int = 2,
-        lora_dropout: float = 0.0,
-        asymmetric: bool = True,
-        **kwargs,
-    ):
-        bnb.nn.Linear8bitLt.__init__(
+
+if _bnb_available:
+    class Linear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
+        def __init__(
             self,
             in_features,
             out_features,
-            bias=kwargs.get("bias", True),
-            has_fp16_weights=kwargs.get("has_fp16_weights", True),
-            memory_efficient_backward=kwargs.get("memory_efficient_backward", False),
-            threshold=kwargs.get("threshold", 0.0),
-            index=kwargs.get("index", None),
-        )
-        LoraLayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, merge_weights=False)
-        
-        self.lora_num = lora_nums
-        self.asymmetric = asymmetric
-        if r > 0:
-            self.lora_route = nn.Linear(in_features, self.lora_num, bias=False)
-            if self.asymmetric:
-                self.lora_A = nn.Linear(in_features, r, bias=False)
-                for i in range(self.lora_num):
-                    setattr(self, f"lora_B{i}", nn.Linear(r, out_features, bias=False))
-            else:
-                for i in range(self.lora_num):
-                    setattr(self, f"lora_A{i}", nn.Linear(in_features, r, bias=False))
-                    setattr(self, f"lora_B{i}", nn.Linear(r, out_features, bias=False))
-            self.scaling = self.lora_alpha / self.r
-            self.weight.requires_grad = False
-        self.reset_parameters()
+            r: int = 0,
+            lora_alpha: int = 1,
+            lora_nums: int = 2,
+            lora_dropout: float = 0.0,
+            asymmetric: bool = True,
+            **kwargs,
+        ):
+            bnb.nn.Linear8bitLt.__init__(
+                self,
+                in_features,
+                out_features,
+                bias=kwargs.get("bias", True),
+                has_fp16_weights=kwargs.get("has_fp16_weights", True),
+                threshold=kwargs.get("threshold", 0.0),
+                index=kwargs.get("index", None),
+            )
+            LoraLayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, merge_weights=False)
 
-    def reset_parameters(self):
-        if hasattr(self, 'r') and self.r > 0:
-            if self.asymmetric:
-                if hasattr(self, "lora_A"):
-                    nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
-                for i in range(self.lora_num):
-                    if hasattr(self, f"lora_B{i}"):
-                        getattr(self, f"lora_B{i}").weight.data.zero_()
-            else:
-                for i in range(self.lora_num):
-                    if hasattr(self, f"lora_A{i}"):
-                        nn.init.kaiming_uniform_(getattr(self, f"lora_A{i}").weight, a=math.sqrt(5))
-                    if hasattr(self, f"lora_B{i}"):
-                        getattr(self, f"lora_B{i}").weight.data.zero_()
-            if hasattr(self, "lora_route"):
-                nn.init.kaiming_uniform_(self.lora_route.weight, a=math.sqrt(5))
+            self.lora_num = lora_nums
+            self.asymmetric = asymmetric
+            if r > 0:
+                self.lora_route = nn.Linear(in_features, self.lora_num, bias=False)
+                if self.asymmetric:
+                    self.lora_A = nn.Linear(in_features, r, bias=False)
+                    for i in range(self.lora_num):
+                        setattr(self, f"lora_B{i}", nn.Linear(r, out_features, bias=False))
+                else:
+                    for i in range(self.lora_num):
+                        setattr(self, f"lora_A{i}", nn.Linear(in_features, r, bias=False))
+                        setattr(self, f"lora_B{i}", nn.Linear(r, out_features, bias=False))
+                self.scaling = self.lora_alpha / self.r
+                self.weight.requires_grad = False
+            self.reset_parameters()
 
-    def forward(self, x: torch.Tensor):
-        result = super().forward(x)
+        def reset_parameters(self):
+            if hasattr(self, 'r') and self.r > 0:
+                if self.asymmetric:
+                    if hasattr(self, "lora_A"):
+                        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+                    for i in range(self.lora_num):
+                        if hasattr(self, f"lora_B{i}"):
+                            getattr(self, f"lora_B{i}").weight.data.zero_()
+                else:
+                    for i in range(self.lora_num):
+                        if hasattr(self, f"lora_A{i}"):
+                            nn.init.kaiming_uniform_(getattr(self, f"lora_A{i}").weight, a=math.sqrt(5))
+                        if hasattr(self, f"lora_B{i}"):
+                            getattr(self, f"lora_B{i}").weight.data.zero_()
+                if hasattr(self, "lora_route"):
+                    nn.init.kaiming_uniform_(self.lora_route.weight, a=math.sqrt(5))
 
-        if self.disable_adapters:
+        def forward(self, x: torch.Tensor):
+            result = super().forward(x)
+
+            if self.disable_adapters:
+                return result
+            elif self.r > 0:
+                if not torch.is_autocast_enabled():
+                    expected_dtype = result.dtype
+                    if x.dtype != torch.float32:
+                        x = x.float()
+
+                    route_logits = self.lora_route(x)
+                    route_weight = nn.functional.softmax(route_logits, dim=-1, dtype=torch.float32).to(expected_dtype)
+
+                    if self.asymmetric:
+                        lora_A_output = self.lora_A(self.lora_dropout(x))
+                        for i in range(self.lora_num):
+                            lora_B = getattr(self, f"lora_B{i}")
+                            scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
+                            lora_output = lora_B(lora_A_output)
+                            result = result + scaled_route * lora_output * self.scaling
+                    else:
+                        dropped_x = self.lora_dropout(x)
+                        for i in range(self.lora_num):
+                            lora_A = getattr(self, f"lora_A{i}")
+                            lora_B = getattr(self, f"lora_B{i}")
+                            lora_A_output = lora_A(dropped_x)
+                            scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
+                            lora_output = lora_B(lora_A_output)
+                            result = result + scaled_route * lora_output * self.scaling
+                    result = result.to(expected_dtype)
+                else:
+                    route_logits = self.lora_route(x)
+                    route_weight = nn.functional.softmax(route_logits, dim=-1, dtype=torch.float32)
+
+                    if self.asymmetric:
+                        lora_A_output = self.lora_A(self.lora_dropout(x))
+                        for i in range(self.lora_num):
+                            lora_B = getattr(self, f"lora_B{i}")
+                            scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
+                            lora_output = lora_B(lora_A_output)
+                            result = result + scaled_route * lora_output * self.scaling
+                    else:
+                        dropped_x = self.lora_dropout(x)
+                        for i in range(self.lora_num):
+                            lora_A = getattr(self, f"lora_A{i}")
+                            lora_B = getattr(self, f"lora_B{i}")
+                            lora_A_output = lora_A(dropped_x)
+                            scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
+                            lora_output = lora_B(lora_A_output)
+                            result = result + scaled_route * lora_output * self.scaling
+
+            blcls = torch.zeros(1, dtype=result.dtype, device=result.device)[0]
             return result
-        elif self.r > 0:
-            if not torch.is_autocast_enabled():
-                expected_dtype = result.dtype
-                if x.dtype != torch.float32:
-                    x = x.float()
-                    
-                route_logits = self.lora_route(x)
-                route_weight = nn.functional.softmax(route_logits, dim=-1, dtype=torch.float32).to(expected_dtype)
-                
-                if self.asymmetric:
-                    lora_A_output = self.lora_A(self.lora_dropout(x))
-                    for i in range(self.lora_num):
-                        lora_B = getattr(self, f"lora_B{i}")
-                        scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
-                        lora_output = lora_B(lora_A_output)
-                        result = result + scaled_route * lora_output * self.scaling
-                else:
-                    dropped_x = self.lora_dropout(x)
-                    for i in range(self.lora_num):
-                        lora_A = getattr(self, f"lora_A{i}")
-                        lora_B = getattr(self, f"lora_B{i}")
-                        lora_A_output = lora_A(dropped_x)
-                        scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
-                        lora_output = lora_B(lora_A_output)
-                        result = result + scaled_route * lora_output * self.scaling
-                result = result.to(expected_dtype)
-            else:
-                route_logits = self.lora_route(x)
-                route_weight = nn.functional.softmax(route_logits, dim=-1, dtype=torch.float32)
-                
-                if self.asymmetric:
-                    lora_A_output = self.lora_A(self.lora_dropout(x))
-                    for i in range(self.lora_num):
-                        lora_B = getattr(self, f"lora_B{i}")
-                        scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
-                        lora_output = lora_B(lora_A_output)
-                        result = result + scaled_route * lora_output * self.scaling
-                else:
-                    dropped_x = self.lora_dropout(x)
-                    for i in range(self.lora_num):
-                        lora_A = getattr(self, f"lora_A{i}")
-                        lora_B = getattr(self, f"lora_B{i}")
-                        lora_A_output = lora_A(dropped_x)
-                        scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
-                        lora_output = lora_B(lora_A_output)
-                        result = result + scaled_route * lora_output * self.scaling
-        
-        blcls = torch.zeros(1, dtype=result.dtype, device=result.device)[0]
-        return result
 
 
-class MergedLinear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        r: int = 0,
-        lora_alpha: int = 1,
-        lora_nums: int = 2,
-        lora_dropout: float = 0.0,
-        enable_lora: List[bool] = [False],
-        asymmetric: bool = True,
-        **kwargs,
-    ):
-        bnb.nn.Linear8bitLt.__init__(
+    class MergedLinear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
+        def __init__(
             self,
-            in_features,
-            out_features,
-            bias=kwargs.get("bias", True),
-            has_fp16_weights=kwargs.get("has_fp16_weights", True),
-            memory_efficient_backward=kwargs.get("memory_efficient_backward", False),
-            threshold=kwargs.get("threshold", 0.0),
-            index=kwargs.get("index", None),
-        )
-        LoraLayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, merge_weights=False)
-        
-        if out_features % len(enable_lora) != 0:
-            raise ValueError("The length of enable_lora must divide out_features")
-            
-        self.enable_lora = enable_lora
-        self.lora_num = lora_nums
-        self.asymmetric = asymmetric
-        
-        if r > 0 and any(enable_lora):
-            self.lora_route = nn.Linear(in_features, self.lora_num, bias=False)
-            if self.asymmetric:
-                self.lora_A = nn.Linear(in_features, r * sum(enable_lora), bias=False)
-                for i in range(self.lora_num):
-                    setattr(self, f"lora_B{i}", nn.Conv1d(
-                        r * sum(enable_lora),
-                        out_features // len(enable_lora) * sum(enable_lora),
-                        kernel_size=1,
-                        groups=sum(enable_lora),
-                        bias=False
-                    ))
-            else:
-                for i in range(self.lora_num):
-                    setattr(self, f"lora_A{i}", nn.Linear(in_features, r * sum(enable_lora), bias=False))
-                    setattr(self, f"lora_B{i}", nn.Conv1d(
-                        r * sum(enable_lora),
-                        out_features // len(enable_lora) * sum(enable_lora),
-                        kernel_size=1,
-                        groups=sum(enable_lora),
-                        bias=False
-                    ))
-            
-            self.scaling = self.lora_alpha / self.r
-            self.weight.requires_grad = False
-            self.lora_ind = self.weight.new_zeros((out_features,), dtype=torch.bool).view(len(enable_lora), -1)
-            self.lora_ind[enable_lora, :] = True
-            self.lora_ind = self.lora_ind.view(-1)
-        self.reset_parameters()
+            in_features: int,
+            out_features: int,
+            r: int = 0,
+            lora_alpha: int = 1,
+            lora_nums: int = 2,
+            lora_dropout: float = 0.0,
+            enable_lora: List[bool] = [False],
+            asymmetric: bool = True,
+            **kwargs,
+        ):
+            bnb.nn.Linear8bitLt.__init__(
+                self,
+                in_features,
+                out_features,
+                bias=kwargs.get("bias", True),
+                has_fp16_weights=kwargs.get("has_fp16_weights", True),
+                memory_efficient_backward=kwargs.get("memory_efficient_backward", False),
+                threshold=kwargs.get("threshold", 0.0),
+                index=kwargs.get("index", None),
+            )
+            LoraLayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, merge_weights=False)
 
-    def reset_parameters(self):
-        if hasattr(self, 'r') and self.r > 0:
-            if self.asymmetric:
-                if hasattr(self, "lora_A"):
-                    nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
-                for i in range(self.lora_num):
-                    if hasattr(self, f"lora_B{i}"):
-                        getattr(self, f"lora_B{i}").weight.data.zero_()
-            else:
-                for i in range(self.lora_num):
-                    if hasattr(self, f"lora_A{i}"):
-                        nn.init.kaiming_uniform_(getattr(self, f"lora_A{i}").weight, a=math.sqrt(5))
-                    if hasattr(self, f"lora_B{i}"):
-                        getattr(self, f"lora_B{i}").weight.data.zero_()
-            if hasattr(self, "lora_route"):
-                nn.init.kaiming_uniform_(self.lora_route.weight, a=math.sqrt(5))
+            if out_features % len(enable_lora) != 0:
+                raise ValueError("The length of enable_lora must divide out_features")
 
-    def zero_pad(self, x):
-        result = x.new_zeros((*x.shape[:-1], self.out_features))
-        result = result.view(-1, self.out_features)
-        result[:, self.lora_ind] = x.reshape(-1, self.out_features // len(self.enable_lora) * sum(self.enable_lora))
-        return result.view((*x.shape[:-1], self.out_features))
+            self.enable_lora = enable_lora
+            self.lora_num = lora_nums
+            self.asymmetric = asymmetric
 
-    def forward(self, x: torch.Tensor, task_types=None):
-        result = super().forward(x)
-        
-        if self.disable_adapters:
+            if r > 0 and any(enable_lora):
+                self.lora_route = nn.Linear(in_features, self.lora_num, bias=False)
+                if self.asymmetric:
+                    self.lora_A = nn.Linear(in_features, r * sum(enable_lora), bias=False)
+                    for i in range(self.lora_num):
+                        setattr(self, f"lora_B{i}", nn.Conv1d(
+                            r * sum(enable_lora),
+                            out_features // len(enable_lora) * sum(enable_lora),
+                            kernel_size=1,
+                            groups=sum(enable_lora),
+                            bias=False
+                        ))
+                else:
+                    for i in range(self.lora_num):
+                        setattr(self, f"lora_A{i}", nn.Linear(in_features, r * sum(enable_lora), bias=False))
+                        setattr(self, f"lora_B{i}", nn.Conv1d(
+                            r * sum(enable_lora),
+                            out_features // len(enable_lora) * sum(enable_lora),
+                            kernel_size=1,
+                            groups=sum(enable_lora),
+                            bias=False
+                        ))
+
+                self.scaling = self.lora_alpha / self.r
+                self.weight.requires_grad = False
+                self.lora_ind = self.weight.new_zeros((out_features,), dtype=torch.bool).view(len(enable_lora), -1)
+                self.lora_ind[enable_lora, :] = True
+                self.lora_ind = self.lora_ind.view(-1)
+            self.reset_parameters()
+
+        def reset_parameters(self):
+            if hasattr(self, 'r') and self.r > 0:
+                if self.asymmetric:
+                    if hasattr(self, "lora_A"):
+                        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+                    for i in range(self.lora_num):
+                        if hasattr(self, f"lora_B{i}"):
+                            getattr(self, f"lora_B{i}").weight.data.zero_()
+                else:
+                    for i in range(self.lora_num):
+                        if hasattr(self, f"lora_A{i}"):
+                            nn.init.kaiming_uniform_(getattr(self, f"lora_A{i}").weight, a=math.sqrt(5))
+                        if hasattr(self, f"lora_B{i}"):
+                            getattr(self, f"lora_B{i}").weight.data.zero_()
+                if hasattr(self, "lora_route"):
+                    nn.init.kaiming_uniform_(self.lora_route.weight, a=math.sqrt(5))
+
+        def zero_pad(self, x):
+            result = x.new_zeros((*x.shape[:-1], self.out_features))
+            result = result.view(-1, self.out_features)
+            result[:, self.lora_ind] = x.reshape(-1, self.out_features // len(self.enable_lora) * sum(self.enable_lora))
+            return result.view((*x.shape[:-1], self.out_features))
+
+        def forward(self, x: torch.Tensor, task_types=None):
+            result = super().forward(x)
+
+            if self.disable_adapters:
+                return result
+            elif self.r > 0:
+                if not torch.is_autocast_enabled():
+                    expected_dtype = result.dtype
+                    if x.dtype != torch.float32:
+                        x = x.float()
+
+                    route_logits = self.lora_route(x)
+                    route_weight = nn.functional.softmax(route_logits, dim=-1, dtype=torch.float32).to(expected_dtype)
+
+                    if self.asymmetric:
+                        lora_A_output = self.lora_A(self.lora_dropout(x))
+                        after_A = lora_A_output.transpose(-2, -1)
+                        for i in range(self.lora_num):
+                            lora_B = getattr(self, f"lora_B{i}")
+                            scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
+                            after_B = lora_B(after_A).transpose(-2, -1)
+                            output = self.zero_pad(after_B).to(expected_dtype) * self.scaling
+                            result = result + scaled_route * output
+                    else:
+                        dropped_x = self.lora_dropout(x)
+                        for i in range(self.lora_num):
+                            lora_A = getattr(self, f"lora_A{i}")
+                            lora_B = getattr(self, f"lora_B{i}")
+                            after_A = lora_A(dropped_x).transpose(-2, -1)
+                            scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
+                            after_B = lora_B(after_A).transpose(-2, -1)
+                            output = self.zero_pad(after_B).to(expected_dtype) * self.scaling
+                            result = result + scaled_route * output
+                    result = result.to(expected_dtype)
+                else:
+                    route_logits = self.lora_route(x)
+                    route_weight = nn.functional.softmax(route_logits, dim=-1, dtype=torch.float32)
+
+                    if self.asymmetric:
+                        lora_A_output = self.lora_A(self.lora_dropout(x))
+                        after_A = lora_A_output.transpose(-2, -1)
+                        for i in range(self.lora_num):
+                            lora_B = getattr(self, f"lora_B{i}")
+                            scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
+                            after_B = lora_B(after_A).transpose(-2, -1)
+                            output = self.zero_pad(after_B) * self.scaling
+                            result = result + scaled_route * output
+                    else:
+                        dropped_x = self.lora_dropout(x)
+                        for i in range(self.lora_num):
+                            lora_A = getattr(self, f"lora_A{i}")
+                            lora_B = getattr(self, f"lora_B{i}")
+                            after_A = lora_A(dropped_x).transpose(-2, -1)
+                            scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
+                            after_B = lora_B(after_A).transpose(-2, -1)
+                            output = self.zero_pad(after_B) * self.scaling
+                            result = result + scaled_route * output
+
+            blcls = torch.zeros(1, dtype=result.dtype, device=result.device)[0]
             return result
-        elif self.r > 0:
-            if not torch.is_autocast_enabled():
-                expected_dtype = result.dtype
-                if x.dtype != torch.float32:
-                    x = x.float()
-                
-                route_logits = self.lora_route(x)
-                route_weight = nn.functional.softmax(route_logits, dim=-1, dtype=torch.float32).to(expected_dtype)
-                
-                if self.asymmetric:
-                    lora_A_output = self.lora_A(self.lora_dropout(x))
-                    after_A = lora_A_output.transpose(-2, -1)
-                    for i in range(self.lora_num):
-                        lora_B = getattr(self, f"lora_B{i}")
-                        scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
-                        after_B = lora_B(after_A).transpose(-2, -1)
-                        output = self.zero_pad(after_B).to(expected_dtype) * self.scaling
-                        result = result + scaled_route * output
-                else:
-                    dropped_x = self.lora_dropout(x)
-                    for i in range(self.lora_num):
-                        lora_A = getattr(self, f"lora_A{i}")
-                        lora_B = getattr(self, f"lora_B{i}")
-                        after_A = lora_A(dropped_x).transpose(-2, -1)
-                        scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
-                        after_B = lora_B(after_A).transpose(-2, -1)
-                        output = self.zero_pad(after_B).to(expected_dtype) * self.scaling
-                        result = result + scaled_route * output
-                result = result.to(expected_dtype)
-            else:
-                route_logits = self.lora_route(x) 
-                route_weight = nn.functional.softmax(route_logits, dim=-1, dtype=torch.float32)
-                
-                if self.asymmetric:
-                    lora_A_output = self.lora_A(self.lora_dropout(x))
-                    after_A = lora_A_output.transpose(-2, -1)
-                    for i in range(self.lora_num):
-                        lora_B = getattr(self, f"lora_B{i}")
-                        scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
-                        after_B = lora_B(after_A).transpose(-2, -1)
-                        output = self.zero_pad(after_B) * self.scaling
-                        result = result + scaled_route * output
-                else:
-                    dropped_x = self.lora_dropout(x)
-                    for i in range(self.lora_num):
-                        lora_A = getattr(self, f"lora_A{i}")
-                        lora_B = getattr(self, f"lora_B{i}")
-                        after_A = lora_A(dropped_x).transpose(-2, -1)
-                        scaled_route = torch.unsqueeze(route_weight[:, :, i], -1)
-                        after_B = lora_B(after_A).transpose(-2, -1)
-                        output = self.zero_pad(after_B) * self.scaling
-                        result = result + scaled_route * output
-                        
-        blcls = torch.zeros(1, dtype=result.dtype, device=result.device)[0]
-        return result

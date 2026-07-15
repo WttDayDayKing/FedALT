@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
+import sys
+import os
 
 import torch
 import json
@@ -16,8 +18,7 @@ from transformers import (
     GenerationConfig
 )
 from peft import LoraConfig, TaskType, get_peft_model
-from utils import prepare_model_for_kbit_training, EvalDataset, write_file
-import evaluate
+from util import prepare_model_for_kbit_training, EvalDataset, write_file
 
 
 class Client:
@@ -51,7 +52,7 @@ class Client:
                 self.model_name,
                 cache_dir=self.cache_path,
                 torch_dtype=torch.float16,
-                load_in_8bit=True,
+                # load_in_8bit=True,
                 device_map="auto",
                 quantization_config=quantization_config,
             )
@@ -99,12 +100,38 @@ class Client:
         return lora_params
     
     def load_params(self, params_or_path):
-        """Load parameters into the model."""
-        if isinstance(params_or_path, dict):
-            params_to_load = params_or_path['params'] if 'params' in params_or_path else params_or_path
-            self.local_model.load_state_dict(params_to_load, strict=False)
+        """Load parameters into the model.
+
+        Args:
+            params_or_path: Either a dict of parameters, or a path to a .pt file
+                            saved by get_lora_params() or a global checkpoint.
+        """
+        if isinstance(params_or_path, str):
+            # Load from a .pt file saved by torch.save
+            checkpoint = torch.load(params_or_path, map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+            if isinstance(checkpoint, dict):
+                if 'params' in checkpoint:
+                    # Format: {'client_id': ..., 'params': {...}}  — from get_lora_params()
+                    params_to_load = checkpoint['params']
+                elif all(isinstance(v, torch.Tensor) for v in checkpoint.values()):
+                    # Format: {name: tensor, ...} — raw state dict
+                    params_to_load = checkpoint
+                else:
+                    raise ValueError(f"Unknown dict format in checkpoint: keys={list(checkpoint.keys())}")
+            elif isinstance(checkpoint, list):
+                # Format: [{name: tensor, ...}, ...] — aggregated_params list
+                # For global checkpoints; this should be used per-client index
+                raise ValueError(
+                    "Detected a list (aggregated global checkpoint). "
+                    "Use load_params(checkpoint[client_index]) instead."
+                )
+            else:
+                raise ValueError(f"Unexpected checkpoint type: {type(checkpoint)}")
         else:
-            self.local_model.load_adapter(params_or_path, adapter_name="default")
+            params_to_load = params_or_path.get('params', params_or_path)
+
+        self.local_model.load_state_dict(params_to_load, strict=False)
+        print(f"  Loaded {len(params_to_load)} parameter tensors into client {self.client_id}")
     
     def local_training(self, lr=2e-4, epochs=1, batch_size=32, gradient_accumulation_steps=1):
         """Perform local training on client data."""
@@ -135,7 +162,7 @@ class Client:
             logging_steps=30,
             optim="adamw_torch",
             weight_decay=0.05,
-            evaluation_strategy="no",
+            eval_strategy="no",
             save_strategy="no",
             remove_unused_columns=False,
             gradient_checkpointing=False
@@ -236,14 +263,15 @@ class Client:
                 dic[data['category']].append(tmpd)
             return dic
 
-        def compute_rouge(predictions: List[str], references: List[str]) -> Dict:
-            rouge = evaluate.load('rouge')
-            results = rouge.compute(
-                predictions=predictions,
-                references=references,
-                use_stemmer=True
-            )
-            return {k: float(v) for k, v in results.items()}
+        def compute_rouge(predictions, references):
+            from rouge_score import rouge_scorer
+            scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+            scores = {'rouge1': [], 'rouge2': [], 'rougeL': []}
+            for pred, ref in zip(predictions, references):
+                result = scorer.score(ref, pred)
+                for key in scores:
+                    scores[key].append(getattr(result[key], 'fmeasure'))
+            return {k: float(sum(v) / len(v)) if v else 0.0 for k, v in scores.items()}
 
         def get_result(targets, predictions, save_path):
             results = {}
