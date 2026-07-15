@@ -25,6 +25,7 @@ def main():
     parser.add_argument('--rank', type=int, default=8, help='LoRA rank')
     parser.add_argument('--dataset',default="flan1",type=str)
     parser.add_argument('--lora_n',default=1)
+    parser.add_argument('--method',type=str,default="fedavg")
 
     args = parser.parse_args()
 
@@ -73,14 +74,18 @@ def main():
         for client_id in range(len(clients))
     }
 
-    lora_dir=os.path.join(result_dir,dataset,"checkpoints")
+    lora_dir=os.path.join(result_dir,dataset,"checkpoints/",args.method)
     for client in tqdm(clients, desc="Client Training"):
-        lora_path=os.path.join(lora_dir,f"client_{client.client_id}.pt")
+        local_lora_path=os.path.join(lora_dir,f"client_{client.client_id}.pt")
         client.load_model()
-        client.load_params(lora_path)
+        client.load_params(local_lora_path)
         client.evaluate_model(test_files[client.client_id], eval_files[client.client_id])
         scores=client.calculate_rouge_scores(test_files[client.client_id], eval_files[client.client_id],score_files[client.client_id])
         print(scores)
+    
+    # global_lora_path=os.path.join(lora_dir,"global.pt")
+
+    
 
 if __name__ == "__main__":
     main()

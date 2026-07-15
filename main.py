@@ -26,7 +26,8 @@ def train_federated(
     result_dir,
     dataset,
     lora_n,
-    lr=1e-8
+    lr=1e-8,
+    method="fedavg",
 ):
     """
     Main federated training loop.
@@ -43,7 +44,7 @@ def train_federated(
         lr: Learning rate
     """
     all_client_scores = {client.client_id: [] for client in clients}
-    clients_checkpoints=os.path.join(result_dir,dataset,"checkpoints_lora")
+    clients_checkpoints=os.path.join(result_dir,dataset,"checkpoints/","method")
     os.makedirs(clients_checkpoints,exist_ok=True)
     for round_idx in tqdm(range(global_rounds), desc="Global Rounds"):
         print(f"\nGlobal Round {round_idx + 1}/{global_rounds}")
@@ -117,13 +118,14 @@ def main():
     parser.add_argument('--model_name', type=str, default='/data/dataset/models/Llama-2-7b-hf', help='Base model name')
     parser.add_argument('--data_path', type=str, default='/data/wtt/2026/FedDPA/data/dataset1', help='Path to training data directory')
     parser.add_argument('--result_dir', type=str, default='./results', help='Directory to save results')
-    parser.add_argument('--rounds', type=int, default=1, help='Number of global communication rounds')
-    parser.add_argument('--local_epochs', type=int, default=10, help='Number of local training epochs')
+    parser.add_argument('--rounds', type=int, default=10, help='Number of global communication rounds')
+    parser.add_argument('--local_epochs', type=int, default=5, help='Number of local training epochs')
     parser.add_argument('--client_num', type=int, default=1, help='Number of clients')
     parser.add_argument('--lr', type=float, default=3e-4, help='Learning rate')
     parser.add_argument('--rank', type=int, default=8, help='LoRA rank')
     parser.add_argument('--dataset',default="flan1",type=str)
     parser.add_argument('--lora_n',default=1)
+    parser.add_argument('--method',type=str,default="fedavg")
     
     args = parser.parse_args()
     
@@ -136,6 +138,7 @@ def main():
     dataset=args.dataset
     lora_n=args.lora_n
     result_dir = args.result_dir
+    method=args.method
     os.makedirs(result_dir, exist_ok=True)
     
     # Initialize tokenizer and prompter
@@ -205,7 +208,8 @@ def main():
         result_dir=result_dir,
         dataset=dataset,
         lora_n=lora_n,
-        lr=args.lr
+        lr=args.lr,
+        method=method
     )
     
     print("\nTraining completed!")
