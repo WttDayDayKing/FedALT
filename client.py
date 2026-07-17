@@ -18,14 +18,14 @@ from transformers import (
     GenerationConfig
 )
 from peft import LoraConfig, TaskType, get_peft_model
-from util import prepare_model_for_kbit_training, EvalDataset, write_file
+from util import prepare_model_for_kbit_training, EvalDataset, write_file,set_lora_state_dict,get_lora_state_dict
 
 
 class Client:
     """Federated Learning Client with LoRA fine-tuning."""
     
-    def __init__(self, client_id, client_dataset, tokenizer, prompter, model_name, 
-                 rank=8, lora_n=4, asymmetric=False, cache_path='/path/to/output'):
+    def __init__(self, client_id, client_dataset, tokenizer, prompter, model_name, device,
+                 rank=8, lora_n=4, asymmetric=False, cache_path='/data/wtt/2026/FedALT/output'):
         self.client_id = client_id
         self.client_dataset = client_dataset
         self.tokenizer = tokenizer
@@ -37,6 +37,7 @@ class Client:
         self.cache_path = cache_path
         self.local_model = None
         self.current_params = None
+        self.device=device
         
     def load_model(self):
         """Load model with quantization and LoRA configuration."""
@@ -133,18 +134,21 @@ class Client:
         self.local_model.load_state_dict(params_to_load, strict=False)
         print(f"  Loaded {len(params_to_load)} parameter tensors into client {self.client_id}")
     
-    def local_training(self, lr=2e-4, epochs=1, batch_size=32, gradient_accumulation_steps=1):
+    def local_training(self, model,global_state, lr=2e-4, epochs=1, batch_size=32, gradient_accumulation_steps=1):
         """Perform local training on client data."""
-        self.local_model.train()
+        set_lora_state_dict(model, global_state)
+        model.train()
         
         # Only train local LoRA parameters
-        for name, param in self.local_model.named_parameters():
+        for name, param in model.named_parameters():
             if 'lora_A1' in name or 'lora_B1' in name or 'lora_route' in name:
+                param.requires_grad = True
+            elif 'lora_A0' in name or 'lora_B0' in name:
                 param.requires_grad = True
             else:  
                 param.requires_grad = False
 
-        trainable_params = [p for p in self.local_model.parameters() if p.requires_grad]
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
         print(f"Number of trainable parameters: {len(trainable_params)}")
         if len(trainable_params) == 0:
             raise ValueError("No trainable parameters found!")
@@ -169,7 +173,7 @@ class Client:
         )
 
         trainer = Trainer(
-            model=self.local_model,
+            model=model,
             args=training_args,
             train_dataset=self.client_dataset,
             tokenizer=self.tokenizer,
@@ -182,6 +186,9 @@ class Client:
         )
         
         trainer.train()
+
+        client_stat=get_lora_state_dict(model)
+        return client_stat
     
     def evaluate_model(self, test_file, output_file, batch_size=2, temperature=0.1, 
                       top_p=0.75, top_k=40, num_beams=4, max_new_tokens=80):

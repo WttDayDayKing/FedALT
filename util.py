@@ -5,7 +5,68 @@ import torch
 import json
 from typing import Dict, List
 from torch.utils.data import Dataset
+from transformers import (
+    BitsAndBytesConfig,
+    LlamaForCausalLM,
+    Trainer,
+    TrainingArguments,
+    DataCollatorForSeq2Seq,
+    GenerationConfig
+)
+from peft import LoraConfig, TaskType, get_peft_model
+from datasets import load_dataset
+from transformers import LlamaTokenizer
 
+def get_lora_state_dict(model) -> Dict[str, torch.Tensor]:
+    """提取 LoRA 适配器权重（仅可训练参数）"""
+    state_dict = {}
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            state_dict[name] = param.detach().cpu().clone()
+    return state_dict
+
+
+def set_lora_state_dict(model, state_dict: Dict[str, torch.Tensor]):
+    """设置 LoRA 适配器权重"""
+    model.load_state_dict(state_dict, strict=False)
+
+def load_base_model(model_name, rank,lora_alpha,lora_n,device: torch.device = torch.device("cuda:0")):
+    device_map_str = device.type if device.type == "cpu" else f"cuda:{device.index or 0}"
+    bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+    model = LlamaForCausalLM.from_pretrained(
+                model_name,
+                # cache_dir=self.cache_path,
+                torch_dtype=torch.float16,
+                # load_in_8bit=True,
+                device_map=device_map_str,
+                quantization_config=bnb_config,
+               
+            )
+            
+    model = prepare_model_for_kbit_training(
+        model,
+        use_gradient_checkpointing=False
+    )
+    
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        target_modules=["q_proj", "v_proj"],
+        inference_mode=False,
+        r=rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=0.05,
+        lora_nums=lora_n,
+        asymmetric=False,
+        bias="none"
+    )       
+    
+   
+    tokenizer = LlamaTokenizer.from_pretrained(model_name)
+    tokenizer.pad_token_id = 0
+    tokenizer.padding_side = "left"
+
+    model = get_peft_model(model, peft_config)
+    return model, tokenizer
 
 def print_gpu_memory():
     """Print current GPU memory usage."""

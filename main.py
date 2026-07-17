@@ -125,7 +125,10 @@ def main():
     parser.add_argument('--rank', type=int, default=8, help='LoRA rank')
     parser.add_argument('--dataset',default="flan1",type=str)
     parser.add_argument('--lora_n',default=1)
+    parser.add_argument('--lora_alpha',default=32)
     parser.add_argument('--method',type=str,default="fedavg")
+    parser.add_argument('--num_gpus',default=4)
+    parser.add_argument('--batch_size',default=8)
     
     args = parser.parse_args()
     
@@ -142,10 +145,10 @@ def main():
     os.makedirs(result_dir, exist_ok=True)
     
     # Initialize tokenizer and prompter
-    prompter = Prompter("alpaca_short")
-    tokenizer = LlamaTokenizer.from_pretrained(model_name)
-    tokenizer.pad_token_id = 0
-    tokenizer.padding_side = "left"
+    # prompter = Prompter("alpaca_short")
+    # tokenizer = LlamaTokenizer.from_pretrained(model_name)
+    # tokenizer.pad_token_id = 0
+    # tokenizer.padding_side = "left"
     
     # Dataset mapping
     test_client_pairs = {
@@ -160,64 +163,69 @@ def main():
     }
     
     # Initialize clients
-    clients = []
-    for client_id in range(client_num):
-        local_data_path = os.path.join(data_path, "8/" f"local_training_{client_id}.json")
-        client_data = load_dataset("json", data_files=local_data_path)
-        local_data = prepare_local_dataset(client_data, tokenizer, prompter)
-        clients.append(Client(
-            client_id,
-            local_data,
-            tokenizer,
-            prompter,
-            model_name,
-            rank=args.rank,
-            lora_n=2,
-            asymmetric=False,
-            cache_path=result_dir
-        ))
+    # clients = []
+    # for client_id in range(client_num):
+    #     local_data_path = os.path.join(data_path, "8/" f"local_training_{client_id}.json")
+    #     client_data = load_dataset("json", data_files=local_data_path)
+    #     local_data = prepare_local_dataset(client_data, tokenizer, prompter)
+    #     clients.append(Client(
+    #         client_id,
+    #         local_data,
+    #         tokenizer,
+    #         prompter,
+    #         model_name,
+    #         rank=args.rank,
+    #         lora_n=2,
+    #         asymmetric=False,
+    #         cache_path=result_dir
+    #     ))
     
     # Initialize server
-    server = Server(clients_num=len(clients))
+    server = Server(args)
+    server.setup_clients()
+    clients_checkpoints=os.path.join(result_dir,dataset,"checkpoints/","method")
+    os.makedirs(clients_checkpoints,exist_ok=True)
+    server.train(clients_checkpoints=clients_checkpoints)
+
     
-    # Setup file paths
-    save_dir=os.path.join(result_dir,"eval")
-    os.makedirs(save_dir, exist_ok=True)
-    eval_files = {
-        client_id: f"{save_dir}/eval_client{client_id}.jsonl"
-        for client_id in range(len(clients))
-    }
-    score_files = {
-        client_id: f"{save_dir}/scores_client{client_id}.json"
-        for client_id in range(len(clients))
-    }
-    test_files = {
-        client_id: os.path.join(data_path, "test", f"local_testing_{client_id}.jsonl")
-        for client_id in range(len(clients))
-    }
+    # # Setup file paths
+    # save_dir=os.path.join(result_dir,"eval")
+    # os.makedirs(save_dir, exist_ok=True)
+    # eval_files = {
+    #     client_id: f"{save_dir}/eval_client{client_id}.jsonl"
+    #     for client_id in range(len(clients))
+    # }
+    # score_files = {
+    #     client_id: f"{save_dir}/scores_client{client_id}.json"
+    #     for client_id in range(len(clients))
+    # }
+    # test_files = {
+    #     client_id: os.path.join(data_path, "test", f"local_testing_{client_id}.jsonl")
+    #     for client_id in range(len(clients))
+    # }
     
-    # Run federated training
-    all_client_scores = train_federated(
-        clients=clients,
-        server=server,
-        global_rounds=rounds,
-        local_epochs=local_epochs,
-        test_files=test_files,
-        eval_files=eval_files,
-        score_files=score_files,
-        result_dir=result_dir,
-        dataset=dataset,
-        lora_n=lora_n,
-        lr=args.lr,
-        method=method
-    )
+    # # Run federated training
+    # all_client_scores = train_federated(
+    #     clients=clients,
+    #     server=server,
+    #     global_rounds=rounds,
+    #     local_epochs=local_epochs,
+    #     test_files=test_files,
+    #     eval_files=eval_files,
+    #     score_files=score_files,
+    #     result_dir=result_dir,
+    #     dataset=dataset,
+    #     lora_n=lora_n,
+    #     lr=args.lr,
+    #     method=method
+    # )
     
-    print("\nTraining completed!")
-    print("Final Evaluation Scores for each client:", all_client_scores)
+    # print("\nTraining completed!")
+    # print("Final Evaluation Scores for each client:", all_client_scores)
     
-    # Save final results
-    with open(f"{result_dir}/final_scores.json", 'w') as f:
-        json.dump(all_client_scores, f, indent=2)
+    # # Save final results
+    # with open(f"{result_dir}/final_scores.json", 'w') as f:
+    #     json.dump(all_client_scores, f, indent=2)
 
 
 if __name__ == "__main__":
