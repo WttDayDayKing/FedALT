@@ -504,6 +504,9 @@ if _bnb_available:
                             lora_A_output = lora_A(dropped_x)
                             scaled_route = torch.unsqueeze(route_weight[:, :, i], -1) if route_weight is not None else None
                             lora_output = lora_B(lora_A_output)
+                            # ``result`` can be a view returned by the 8-bit
+                            # custom autograd Function.  Updating that view
+                            # in-place breaks its backward contract.
                             result = result + (scaled_route if scaled_route is not None else 1.0) * lora_output * self.scaling
 
             blcls = torch.zeros(1, dtype=result.dtype, device=result.device)[0]

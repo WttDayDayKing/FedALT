@@ -113,8 +113,38 @@ python main.py \
   --rounds 20 \
   --local_epochs 5 \
   --client_num 8 \
-  --lr 3e-4
+  --lr 3e-4 \
+  --num_gpus 4
 ```
+
+Each training launch writes a timestamped `training_config_*.json` alongside
+the checkpoints. It records the effective command, all arguments, working
+directory, and `CUDA_VISIBLE_DEVICES` for reproducibility.
+
+### Multi-client, multi-GPU training
+
+`main.py` starts one worker process per selected GPU. Each worker keeps one
+quantized model resident on its GPU and trains its assigned clients in sequence;
+workers run concurrently. Therefore 8 clients on 4 GPUs run as four parallel
+workers with two clients per worker, without loading two models on one GPU.
+
+Use the first visible GPUs with `--num_gpus`, or select visible GPU indices
+explicitly with `--gpu_ids`:
+
+```bash
+python main.py --client_num 8 --num_gpus 4 --partition_dir 8
+python main.py --client_num 8 --gpu_ids 0,2,3 --partition_dir 8
+```
+
+The process must see all selected GPUs (for example, do not restrict them out
+through `CUDA_VISIBLE_DEVICES`). Client training data is expected at
+`<data_path>/<partition_dir>/local_training_<client_id>.json`.
+
+For 24GB GPUs, the default per-GPU batch size is `1` and activation checkpointing
+is enabled. The default `--gradient_accumulation_steps 8` retains an effective
+batch size of 8 without keeping eight samples' activations on the GPU. If the
+allocator reports fragmentation, `main.py` enables
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` before importing PyTorch.
 
 ## Project Structure
 
@@ -135,6 +165,36 @@ FedALT_code/
 ```
 
 ## Evaluation
+
+Run inference and ROUGE evaluation from the final per-client `global.pt`:
+
+```bash
+python infer.py \
+  --model_name meta-llama/Llama-2-7b-hf \
+  --data_path ./data \
+  --result_dir ./results \
+  --dataset flan1 \
+  --method fedavg \
+  --client_num 8
+```
+
+The script automatically loads
+`<result_dir>/<dataset>/checkpoints/<method>/global.pt`, reuses one 8-bit model
+on `--gpu_id 0` by default, applies the state corresponding to each client, and
+stores predictions, per-client ROUGE scores, and a summary under
+`<result_dir>/<dataset>/eval/<method>/`. To use each client's independently
+saved adapter, pass its containing directory; the script then loads
+`client_<id>.pt` for every selected client:
+
+```bash
+python infer.py \
+  --checkpoint_dir /data/wtt/2026/FedALT/results/flan1/checkpoints/method \
+  --client_ids all \
+  --client_num 4
+```
+
+To evaluate one saved client adapter, pass
+`--checkpoint_path .../client_0.pt --client_ids 0`.
 
 The framework evaluates models using ROUGE metrics across multiple NLP tasks:
 
@@ -168,4 +228,3 @@ If you find this work useful, please cite our paper:
 
 - [Paper (arXiv)](https://arxiv.org/abs/2503.11880)
 ---
-

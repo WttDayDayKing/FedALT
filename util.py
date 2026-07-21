@@ -30,22 +30,68 @@ def set_lora_state_dict(model, state_dict: Dict[str, torch.Tensor]):
     """设置 LoRA 适配器权重"""
     model.load_state_dict(state_dict, strict=False)
 
-def load_base_model(model_name, rank,lora_alpha,lora_n,device: torch.device = torch.device("cuda:0")):
-    device_map_str = device.type if device.type == "cpu" else f"cuda:{device.index or 0}"
+def load_params(model, params_or_path):
+        """Load parameters into the model.
+
+        Args:
+            params_or_path: Either a dict of parameters, or a path to a .pt file
+                            saved by get_lora_params() or a global checkpoint.
+        """
+        if isinstance(params_or_path, str):
+            # Load from a .pt file saved by torch.save
+            checkpoint = torch.load(params_or_path, map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+            if isinstance(checkpoint, dict):
+                if 'params' in checkpoint:
+                    # Format: {'client_id': ..., 'params': {...}}  — from get_lora_params()
+                    params_to_load = checkpoint['params']
+                elif all(isinstance(v, torch.Tensor) for v in checkpoint.values()):
+                    # Format: {name: tensor, ...} — raw state dict
+                    params_to_load = checkpoint
+                else:
+                    raise ValueError(f"Unknown dict format in checkpoint: keys={list(checkpoint.keys())}")
+            elif isinstance(checkpoint, list):
+                # Format: [{name: tensor, ...}, ...] — aggregated_params list
+                # For global checkpoints; this should be used per-client index
+                raise ValueError(
+                    "Detected a list (aggregated global checkpoint). "
+                    "Use load_params(checkpoint[client_index]) instead."
+                )
+            else:
+                raise ValueError(f"Unexpected checkpoint type: {type(checkpoint)}")
+        else:
+            params_to_load = params_or_path.get('params', params_or_path)
+
+        model.load_state_dict(params_to_load, strict=False)
+        print(f"  Loaded {len(params_to_load)} parameter tensors into client {self.client_id}")
+def load_base_model(
+    model_name,
+    rank,
+    lora_alpha,
+    lora_n,
+    device: torch.device = torch.device("cuda:0"),
+    gradient_checkpointing: bool = True,
+):
+    # Accelerate validates 8-bit models against the process-local CUDA device.
+    # A one-entry device map is the supported way to state that placement.
+    device_map = "cpu" if device.type == "cpu" else {"": device.index or 0}
     bnb_config = BitsAndBytesConfig(load_in_8bit=True)
     model = LlamaForCausalLM.from_pretrained(
                 model_name,
                 # cache_dir=self.cache_path,
                 torch_dtype=torch.float16,
                 # load_in_8bit=True,
-                device_map=device_map_str,
+                device_map=device_map,
                 quantization_config=bnb_config,
                
             )
             
+    if gradient_checkpointing:
+        # Causal-LM KV cache is incompatible with checkpointed training and
+        # otherwise keeps a large activation cache alive for every batch.
+        model.config.use_cache = False
     model = prepare_model_for_kbit_training(
         model,
-        use_gradient_checkpointing=False
+        use_gradient_checkpointing=gradient_checkpointing,
     )
     
     peft_config = LoraConfig(

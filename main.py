@@ -1,231 +1,121 @@
 #!/usr/bin/env python
 # coding: utf-8
-import sys
-import os
+"""FedALT multi-client, multi-GPU training entry point."""
 
-import json
 import argparse
-from datasets import load_dataset
-from transformers import LlamaTokenizer
-from tqdm import tqdm
-import torch
-from utils.prompter import Prompter
-from util import prepare_local_dataset, get_round_specific_paths, print_gpu_memory
-from client import Client
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+# This must be configured before importing PyTorch through ``server``.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 from server import Server
 
 
-def train_federated(
-    clients,
-    server,
-    global_rounds,
-    local_epochs,
-    test_files, 
-    eval_files,  
-    score_files,
-    result_dir,
-    dataset,
-    lora_n,
-    lr=1e-8,
-    method="fedavg",
-):
-    """
-    Main federated training loop.
-    
-    Args:
-        clients: List of Client instances
-        server: Server instance
-        global_rounds: Number of global communication rounds
-        local_epochs: Number of local training epochs per round
-        test_files: Dictionary mapping client_id to test file paths
-        eval_files: Dictionary mapping client_id to evaluation output paths
-        score_files: Dictionary mapping client_id to score output paths
-        result_dir: Directory to save results
-        lr: Learning rate
-    """
-    all_client_scores = {client.client_id: [] for client in clients}
-    clients_checkpoints=os.path.join(result_dir,dataset,"checkpoints/","method")
-    os.makedirs(clients_checkpoints,exist_ok=True)
-    for round_idx in tqdm(range(global_rounds), desc="Global Rounds"):
-        print(f"\nGlobal Round {round_idx + 1}/{global_rounds}")
-        
-        round_eval_files, round_score_files = get_round_specific_paths(
-            eval_files, score_files, round_idx
-        )
-        
-        # Local training phase
-        client_params = []
-        for client in tqdm(clients, desc="Client Training"):
-            client.load_model()
-            if round_idx > 0:
-                client.load_params(aggregated_params[client.client_id])
-            client.local_training(lr=lr, epochs=local_epochs, batch_size=8)
-            params = client.get_lora_params()
-            client_save_path=os.path.join(clients_checkpoints,f"client_{client.client_id}.pt")
-            torch.save(params,client_save_path)
-            client_params.append(params['params'])
-            print("Before unloading:")
-            print_gpu_memory()
-            client.unload_model()
-            print("After unloading:")
-            print_gpu_memory()
-            
-        # Server aggregation phase
-        if round_idx >= 0:
-            if lora_n>1:
-                aggregated_params = server.aggregation(
-                    route_aggregation=False,
-                    params=client_params
-                )
-            else:
-                aggregated_params = server.aggregation_wtt(
-                    route_aggregation=False,
-                    params=client_params
-                )
-                global_path=os.path.join(clients_checkpoints,"global.pt")
-                torch.save(aggregated_params,global_path)
-        
-        ######Evaluation see infer.py
-        # Evaluation phase (every 5 rounds)
-        # if (round_idx + 1) % 5 == 0:
-        #     print(f"\nRound {round_idx + 1} Evaluation Scores:")
-        #     round_scores = {}
-        #     for client in clients:
-        #         client_id = client.client_id
-        #         client.load_model()
-        #         client.load_params(aggregated_params[client_id])
-        #         scores = client.evaluate_and_score(
-        #             test_file=test_files[client_id],
-        #             output_file=round_eval_files[client_id], 
-        #             score_file=round_score_files[client_id]   
-        #         )
-        #         all_client_scores[client_id].append(scores)
-        #         round_scores[client_id] = scores
-        #         print(f"\nClient {client_id} ROUGE Scores:")
-        #         print(scores)
-        #         client.unload_model()
-                
-        #     summary_file = os.path.join(result_dir, f"round_summary_{round_idx + 1}.json")
-        #     with open(summary_file, 'w') as f:
-        #         json.dump(round_scores, f, indent=2)
-    
-    return all_client_scores
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="FedALT: Federated Fine-Tuning with Adaptive Local Training"
+    )
+    parser.add_argument("--model_name", type=str, default="/data/dataset/models/Llama-2-7b-hf")
+    parser.add_argument(
+        "--data_path",
+        type=str,
+        default="/data/wtt/2026/FedDPA/data/dataset1",
+        help="Root containing the partition directory and test directory",
+    )
+    parser.add_argument("--result_dir", type=str, default="./results")
+    parser.add_argument("--dataset", type=str, default="flan1", help="Result subdirectory name")
+    parser.add_argument("--method", type=str, default="fedavg", help="Checkpoint subdirectory name")
+
+    parser.add_argument("--rounds", type=int, default=10, help="Global communication rounds")
+    parser.add_argument("--local_epochs", type=int, default=5, help="Local epochs in each round")
+    parser.add_argument("--client_num", type=int, default=8, help="Number of participating clients")
+    parser.add_argument("--partition_dir", type=str, default="8", help="Contains local_training_<id>.json")
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--rank", type=int, default=8, help="LoRA rank")
+    parser.add_argument("--lora_n", type=int, default=1, help="Number of LoRA adapters")
+    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--seed", type=int, default=42, help="Shared initial LoRA seed")
+
+    parser.add_argument("--num_gpus", type=int, default=4, help="Number of visible GPUs to use")
+    parser.add_argument(
+        "--gpu_ids",
+        type=str,
+        default=None,
+        help="Optional comma-separated visible GPU indices, for example 0,2,3",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1,
+        help="Per-GPU batch size; 1 is the safe default for 24GB GPUs",
+    )
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=8,
+        help="Number of local batches accumulated before an optimizer step",
+    )
+    parser.set_defaults(gradient_checkpointing=True)
+    parser.add_argument(
+        "--no_gradient_checkpointing",
+        dest="gradient_checkpointing",
+        action="store_false",
+        help="Disable activation checkpointing; this requires substantially more GPU memory",
+    )
+    return parser
 
 
-def main():
-    """Main entry point for FedALT training."""
-    parser = argparse.ArgumentParser(description='FedALT: Federated Fine-Tuning with Adaptive Local Training')
-    parser.add_argument('--model_name', type=str, default='/data/dataset/models/Llama-2-7b-hf', help='Base model name')
-    parser.add_argument('--data_path', type=str, default='/data/wtt/2026/FedDPA/data/dataset1', help='Path to training data directory')
-    parser.add_argument('--result_dir', type=str, default='./results', help='Directory to save results')
-    parser.add_argument('--rounds', type=int, default=10, help='Number of global communication rounds')
-    parser.add_argument('--local_epochs', type=int, default=5, help='Number of local training epochs')
-    parser.add_argument('--client_num', type=int, default=1, help='Number of clients')
-    parser.add_argument('--lr', type=float, default=3e-4, help='Learning rate')
-    parser.add_argument('--rank', type=int, default=8, help='LoRA rank')
-    parser.add_argument('--dataset',default="flan1",type=str)
-    parser.add_argument('--lora_n',default=1)
-    parser.add_argument('--lora_alpha',default=32)
-    parser.add_argument('--method',type=str,default="fedavg")
-    parser.add_argument('--num_gpus',default=4)
-    parser.add_argument('--batch_size',default=8)
-    
-    args = parser.parse_args()
-    
-    # Configuration from arguments
-    local_epochs = args.local_epochs
-    rounds = args.rounds
-    client_num = args.client_num
-    model_name = args.model_name
-    data_path = args.data_path
-    dataset=args.dataset
-    lora_n=args.lora_n
-    result_dir = args.result_dir
-    method=args.method
-    os.makedirs(result_dir, exist_ok=True)
-    
-    # Initialize tokenizer and prompter
-    # prompter = Prompter("alpaca_short")
-    # tokenizer = LlamaTokenizer.from_pretrained(model_name)
-    # tokenizer.pad_token_id = 0
-    # tokenizer.padding_side = "left"
-    
-    # Dataset mapping
-    test_client_pairs = {
-        0: 'ag_news_subset',
-        1: 'snli',
-        2: 'openbookqa',
-        3: 'glue_mrpc',
-        4: 'story_cloze',
-        5: 'common_gen',
-        6: 'sentiment140',
-        7: 'definite_pronoun_resolution'
+def validate_args(args) -> None:
+    positive_values = {
+        "rounds": args.rounds,
+        "local_epochs": args.local_epochs,
+        "client_num": args.client_num,
+        "rank": args.rank,
+        "lora_n": args.lora_n,
+        "lora_alpha": args.lora_alpha,
+        "batch_size": args.batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
     }
-    
-    # Initialize clients
-    # clients = []
-    # for client_id in range(client_num):
-    #     local_data_path = os.path.join(data_path, "8/" f"local_training_{client_id}.json")
-    #     client_data = load_dataset("json", data_files=local_data_path)
-    #     local_data = prepare_local_dataset(client_data, tokenizer, prompter)
-    #     clients.append(Client(
-    #         client_id,
-    #         local_data,
-    #         tokenizer,
-    #         prompter,
-    #         model_name,
-    #         rank=args.rank,
-    #         lora_n=2,
-    #         asymmetric=False,
-    #         cache_path=result_dir
-    #     ))
-    
-    # Initialize server
-    server = Server(args)
-    server.setup_clients()
-    clients_checkpoints=os.path.join(result_dir,dataset,"checkpoints/","method")
-    os.makedirs(clients_checkpoints,exist_ok=True)
-    server.train(clients_checkpoints=clients_checkpoints)
+    invalid = [name for name, value in positive_values.items() if value < 1]
+    if invalid:
+        raise ValueError("These arguments must be positive: " + ", ".join(invalid))
 
-    
-    # # Setup file paths
-    # save_dir=os.path.join(result_dir,"eval")
-    # os.makedirs(save_dir, exist_ok=True)
-    # eval_files = {
-    #     client_id: f"{save_dir}/eval_client{client_id}.jsonl"
-    #     for client_id in range(len(clients))
-    # }
-    # score_files = {
-    #     client_id: f"{save_dir}/scores_client{client_id}.json"
-    #     for client_id in range(len(clients))
-    # }
-    # test_files = {
-    #     client_id: os.path.join(data_path, "test", f"local_testing_{client_id}.jsonl")
-    #     for client_id in range(len(clients))
-    # }
-    
-    # # Run federated training
-    # all_client_scores = train_federated(
-    #     clients=clients,
-    #     server=server,
-    #     global_rounds=rounds,
-    #     local_epochs=local_epochs,
-    #     test_files=test_files,
-    #     eval_files=eval_files,
-    #     score_files=score_files,
-    #     result_dir=result_dir,
-    #     dataset=dataset,
-    #     lora_n=lora_n,
-    #     lr=args.lr,
-    #     method=method
-    # )
-    
-    # print("\nTraining completed!")
-    # print("Final Evaluation Scores for each client:", all_client_scores)
-    
-    # # Save final results
-    # with open(f"{result_dir}/final_scores.json", 'w') as f:
-    #     json.dump(all_client_scores, f, indent=2)
+
+def save_run_config(args, checkpoint_dir: Path) -> Path:
+    """Persist a non-overwriting snapshot next to the model checkpoints."""
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    config_path = checkpoint_dir / f"training_config_{timestamp}.json"
+    config = {
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "command": [sys.executable, *sys.argv],
+        "working_directory": str(Path.cwd()),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "arguments": vars(args),
+    }
+    with config_path.open("w", encoding="utf-8") as handle:
+        json.dump(config, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+    return config_path
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    validate_args(args)
+
+    checkpoint_dir = Path(args.result_dir) / args.dataset / "checkpoints" / args.method
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    config_path = save_run_config(args, checkpoint_dir)
+    print(f"[FedALT] checkpoints: {checkpoint_dir}", flush=True)
+    print(f"[FedALT] configuration: {config_path}", flush=True)
+
+    # ``Server`` owns data validation, GPU selection, worker creation, and
+    # federated aggregation. Do not call the removed legacy setup_clients().
+    server = Server(args)
+    server.train(clients_checkpoints=str(checkpoint_dir))
 
 
 if __name__ == "__main__":

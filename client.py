@@ -25,7 +25,8 @@ class Client:
     """Federated Learning Client with LoRA fine-tuning."""
     
     def __init__(self, client_id, client_dataset, tokenizer, prompter, model_name, device,
-                 rank=8, lora_n=4, asymmetric=False, cache_path='/data/wtt/2026/FedALT/output'):
+                 rank=8, lora_n=4, asymmetric=False, cache_path='/data/wtt/2026/FedALT/output',
+                 gradient_checkpointing=True):
         self.client_id = client_id
         self.client_dataset = client_dataset
         self.tokenizer = tokenizer
@@ -38,7 +39,8 @@ class Client:
         self.local_model = None
         self.current_params = None
         self.device=device
-        
+        self.gradient_checkpointing = gradient_checkpointing
+
     def load_model(self):
         """Load model with quantization and LoRA configuration."""
         if self.local_model is None:
@@ -60,8 +62,10 @@ class Client:
             
             self.local_model = prepare_model_for_kbit_training(
                 self.local_model,
-                use_gradient_checkpointing=False
+                use_gradient_checkpointing=self.gradient_checkpointing
             )
+            if self.gradient_checkpointing:
+                self.local_model.config.use_cache = False
             
             peft_config = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
@@ -134,9 +138,10 @@ class Client:
         self.local_model.load_state_dict(params_to_load, strict=False)
         print(f"  Loaded {len(params_to_load)} parameter tensors into client {self.client_id}")
     
-    def local_training(self, model,global_state, lr=2e-4, epochs=1, batch_size=32, gradient_accumulation_steps=1):
+    def local_training(self, model, global_state=None, lr=2e-4, epochs=1, batch_size=1, gradient_accumulation_steps=1):
         """Perform local training on client data."""
-        set_lora_state_dict(model, global_state)
+        if global_state:
+            set_lora_state_dict(model, global_state)
         model.train()
         
         # Only train local LoRA parameters
@@ -169,7 +174,7 @@ class Client:
             eval_strategy="no",
             save_strategy="no",
             remove_unused_columns=False,
-            gradient_checkpointing=False
+            gradient_checkpointing=self.gradient_checkpointing,
         )
 
         trainer = Trainer(
@@ -188,6 +193,16 @@ class Client:
         trainer.train()
 
         client_stat=get_lora_state_dict(model)
+
+        # Trainer retains references to optimizer and gradients.  Release them
+        # before the next client reuses this worker's resident model.
+        del trainer
+        del training_args
+
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return client_stat
     
     def evaluate_model(self, test_file, output_file, batch_size=2, temperature=0.1, 
