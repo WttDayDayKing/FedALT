@@ -189,15 +189,15 @@ def main():
     parser.add_argument("--data_path", type=str, default="/data/wtt/2026/FedDPA/data/dataset1")
     parser.add_argument("--result_dir", type=str, default="./results")
     parser.add_argument("--dataset", type=str, default="flan1")
-    parser.add_argument("--method", type=str, default="fedavg")
+    parser.add_argument("--method", type=str, default="fedalt")
     parser.add_argument("--checkpoint_path", type=Path, default=None, help="global.pt or a single client_*.pt")
     parser.add_argument(
         "--checkpoint_dir",
         type=Path,
-        default="/data/wtt/2026/FedALT/results/flan1/checkpoints/method",
+        default="/data/wtt/2026/FedALT/results/flan1/checkpoints/fedalt",
         help="Directory containing client_<id>.pt files; loads one checkpoint per selected client",
     )
-    parser.add_argument("--client_num", type=int, default=4)
+    parser.add_argument("--client_num", type=int, default=8)
     parser.add_argument("--client_ids", type=str, default="all", help="'all' or comma-separated IDs")
     parser.add_argument("--test_dir", type=Path, default=None, help="Defaults to <data_path>/test")
     parser.add_argument("--output_dir", type=Path, default=None, help="Defaults to <result_dir>/<dataset>/eval/<method>")

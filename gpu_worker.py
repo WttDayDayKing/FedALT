@@ -1,25 +1,20 @@
-"""GPU worker entry point used by :mod:`server`.
-
-Each process owns exactly one GPU and loads one model.  The process can train
-multiple clients serially, which keeps the model resident on that GPU while
-preventing two quantized model copies from competing for the same memory.
-"""
+"""Persistent single-GPU workers for dynamically scheduled FedALT clients."""
 
 import gc
+import io
 import os
 import traceback
 
 import torch
 
 from client import Client
+from feddcr import state_update_sketch
 from util import get_lora_state_dict, load_base_model, load_dataset, prepare_local_dataset
 from utils.prompter import Prompter
 
 
 def _data_file(args, client_id: int) -> str:
-    return os.path.join(
-        args.data_path, args.partition_dir, f"local_training_{client_id}.json"
-    )
+    return os.path.join(args.data_path, args.partition_dir, f"local_training_{client_id}.json")
 
 
 def _cuda_visible_device(gpu_id: int) -> str:
@@ -37,17 +32,14 @@ def _cuda_visible_device(gpu_id: int) -> str:
     return visible_devices[gpu_id]
 
 
-def client_worker(gpu_id, client_ids, args, client_states, result_queue):
-    """Train ``client_ids`` on one physical GPU and return their LoRA states.
+def client_worker(gpu_id, args, client_states, prototypes, task_queue, result_queue):
+    """Keep one model on ``gpu_id`` and pull clients from ``task_queue``.
 
-    ``spawn`` starts a fresh Python interpreter. Restricting the worker to one
-    card before its first CUDA call makes that card process-local ``cuda:0``,
-    which is also the device Accelerate expects for an 8-bit model.
+    A worker receives a new client only after it has completely released the
+    previous client's trainer state. Faster GPUs therefore keep working rather
+    than waiting for a statically assigned slow client on another GPU.
     """
     model = None
-    results = {}
-    errors = {}
-
     try:
         physical_device = _cuda_visible_device(gpu_id)
         os.environ["CUDA_VISIBLE_DEVICES"] = physical_device
@@ -57,8 +49,7 @@ def client_worker(gpu_id, client_ids, args, client_states, result_queue):
         torch.cuda.manual_seed_all(args.seed)
 
         print(
-            f"[Worker GPU {gpu_id} (CUDA_VISIBLE_DEVICES={physical_device})] "
-            f"clients: {list(client_ids)}",
+            f"[Worker GPU {gpu_id} (CUDA_VISIBLE_DEVICES={physical_device})] ready",
             flush=True,
         )
         model, tokenizer = load_base_model(
@@ -72,7 +63,12 @@ def client_worker(gpu_id, client_ids, args, client_states, result_queue):
         initial_state = get_lora_state_dict(model)
         prompter = Prompter("alpaca_short")
 
-        for client_id in client_ids:
+        while True:
+            client_id = task_queue.get()
+            if client_id is None:
+                break
+
+            print(f"[Worker GPU {gpu_id}] training client {client_id}", flush=True)
             try:
                 client_data = load_dataset("json", data_files=_data_file(args, client_id))
                 local_data = prepare_local_dataset(client_data, tokenizer, prompter)
@@ -89,34 +85,55 @@ def client_worker(gpu_id, client_ids, args, client_states, result_queue):
                     cache_path=args.result_dir,
                     gradient_checkpointing=args.gradient_checkpointing,
                 )
-                results[client_id] = client.local_training(
+                starting_state = client_states.get(client_id, initial_state)
+                trained_state, route_metrics = client.local_training(
                     model=model,
-                    # First-round clients must all start from the same seeded
-                    # LoRA state, rather than inheriting a prior client that
-                    # happened to share this worker's GPU.
-                    global_state=client_states.get(client_id, initial_state),
+                    global_state=starting_state,
                     lr=args.lr,
                     epochs=args.local_epochs,
                     batch_size=args.batch_size,
                     gradient_accumulation_steps=args.gradient_accumulation_steps,
+                    feddcr_config={
+                        "sketch_dim": args.feddcr_sketch_dim,
+                        "temperature": args.feddcr_temperature,
+                        "residual_penalty": args.feddcr_residual_penalty,
+                        "ema": args.feddcr_ema,
+                    } if args.feddcr else None,
+                    global_prototype=prototypes.get("global"),
+                    local_prototype=prototypes.get("local", {}).get(client_id),
                 )
+                payload = {
+                    "state": trained_state,
+                    "sketch": state_update_sketch(
+                        starting_state, trained_state, args.feddcr_sketch_dim, "global"
+                    ) if args.feddcr else None,
+                    "metrics": route_metrics,
+                }
+                # Do not put tensors directly on a multiprocessing queue.
+                # PyTorch otherwise shares them through file descriptors; a
+                # fast worker can exit before the parent rebuilds its final
+                # tensor storage. Bytes are self-contained and race-free.
+                payload_buffer = io.BytesIO()
+                torch.save(payload, payload_buffer)
+                result_queue.put(
+                    ("client_result", gpu_id, client_id, payload_buffer.getvalue(), None)
+                )
+                print(f"[Worker GPU {gpu_id}] completed client {client_id}", flush=True)
                 del client, local_data, client_data
                 gc.collect()
                 torch.cuda.empty_cache()
             except Exception:
-                errors[client_id] = traceback.format_exc()
-                print(f"[Worker GPU {gpu_id}] client {client_id} failed:\n{errors[client_id]}", flush=True)
+                error = traceback.format_exc()
+                print(f"[Worker GPU {gpu_id}] client {client_id} failed:\n{error}", flush=True)
+                result_queue.put(("client_result", gpu_id, client_id, None, error))
     except Exception:
-        message = traceback.format_exc()
-        for client_id in client_ids:
-            errors.setdefault(client_id, message)
-        print(f"[Worker GPU {gpu_id}] initialization failed:\n{message}", flush=True)
+        error = traceback.format_exc()
+        print(f"[Worker GPU {gpu_id}] initialization failed:\n{error}", flush=True)
+        result_queue.put(("worker_error", gpu_id, None, None, error))
     finally:
         if model is not None:
             del model
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        # One result per worker makes queue collection deterministic, including
-        # when a worker has more than one assigned client.
-        result_queue.put((gpu_id, results, errors))
+        result_queue.put(("worker_done", gpu_id, None, None, None))

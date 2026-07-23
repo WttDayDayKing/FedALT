@@ -19,8 +19,9 @@ from transformers import (
 )
 from peft import LoraConfig, TaskType, get_peft_model
 from util import prepare_model_for_kbit_training, EvalDataset, write_file,set_lora_state_dict,get_lora_state_dict
-
-
+from feddcr import FedDCRTrainerMixin
+class FedDCRTrainer(FedDCRTrainerMixin, Trainer):
+    pass
 class Client:
     """Federated Learning Client with LoRA fine-tuning."""
     
@@ -138,7 +139,8 @@ class Client:
         self.local_model.load_state_dict(params_to_load, strict=False)
         print(f"  Loaded {len(params_to_load)} parameter tensors into client {self.client_id}")
     
-    def local_training(self, model, global_state=None, lr=2e-4, epochs=1, batch_size=1, gradient_accumulation_steps=1):
+    def local_training(self, model, global_state=None, lr=2e-4, epochs=1, batch_size=1, gradient_accumulation_steps=1,feddcr_config=None,
+                       global_prototype=None, local_prototype=None):
         """Perform local training on client data."""
         if global_state:
             set_lora_state_dict(model, global_state)
@@ -177,7 +179,9 @@ class Client:
             gradient_checkpointing=self.gradient_checkpointing,
         )
 
-        trainer = Trainer(
+        trainer_class = FedDCRTrainer if feddcr_config else Trainer
+
+        trainer = trainer_class(
             model=model,
             args=training_args,
             train_dataset=self.client_dataset,
@@ -189,10 +193,18 @@ class Client:
                 padding=True,
             )
         )
+
+        if feddcr_config:
+            trainer.configure_feddcr(
+                global_prototype, local_prototype,
+                feddcr_config["sketch_dim"], feddcr_config["temperature"],
+                feddcr_config["residual_penalty"], feddcr_config["ema"],
+            )
         
         trainer.train()
 
         client_stat=get_lora_state_dict(model)
+        route_metrics = trainer.feddcr_metrics() if feddcr_config else {}
 
         # Trainer retains references to optimizer and gradients.  Release them
         # before the next client reuses this worker's resident model.
@@ -203,8 +215,9 @@ class Client:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        return client_stat
-    
+        return client_stat,route_metrics
+
+
     def evaluate_model(self, test_file, output_file, batch_size=2, temperature=0.1, 
                       top_p=0.75, top_k=40, num_beams=4, max_new_tokens=80):
         """Evaluate model on test data."""

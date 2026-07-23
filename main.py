@@ -28,17 +28,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--result_dir", type=str, default="./results")
     parser.add_argument("--dataset", type=str, default="flan1", help="Result subdirectory name")
-    parser.add_argument("--method", type=str, default="fedavg", help="Checkpoint subdirectory name")
+    parser.add_argument("--method", type=str, default="fedalt", help="Checkpoint subdirectory name")
 
-    parser.add_argument("--rounds", type=int, default=10, help="Global communication rounds")
+    parser.add_argument("--rounds", type=int, default=20, help="Global communication rounds")
     parser.add_argument("--local_epochs", type=int, default=5, help="Local epochs in each round")
     parser.add_argument("--client_num", type=int, default=8, help="Number of participating clients")
     parser.add_argument("--partition_dir", type=str, default="8", help="Contains local_training_<id>.json")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--rank", type=int, default=8, help="LoRA rank")
-    parser.add_argument("--lora_n", type=int, default=1, help="Number of LoRA adapters")
+    parser.add_argument("--lora_n", type=int, default=2, help="Number of LoRA adapters")
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42, help="Shared initial LoRA seed")
+    parser.add_argument("--feddcr", action="store_true", help="Enable data-function-aware FedDCR routing")
+    parser.add_argument("--feddcr_sketch_dim", type=int, default=1024)
+    parser.add_argument("--feddcr_temperature", type=float, default=0.5)
+    parser.add_argument("--feddcr_residual_penalty", type=float, default=0.5)
+    parser.add_argument("--feddcr_ema", type=float, default=0.9)
 
     parser.add_argument("--num_gpus", type=int, default=4, help="Number of visible GPUs to use")
     parser.add_argument(
@@ -79,10 +84,15 @@ def validate_args(args) -> None:
         "lora_alpha": args.lora_alpha,
         "batch_size": args.batch_size,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "feddcr_sketch_dim": args.feddcr_sketch_dim,
     }
     invalid = [name for name, value in positive_values.items() if value < 1]
     if invalid:
         raise ValueError("These arguments must be positive: " + ", ".join(invalid))
+    if args.feddcr and args.lora_n != 2:
+        raise ValueError("FedDCR requires exactly --lora_n 2 (shared and private)")
+    if args.feddcr_temperature <= 0 or not 0 <= args.feddcr_ema < 1:
+        raise ValueError("FedDCR temperature must be positive and EMA must be in [0, 1)")
 
 
 def save_run_config(args, checkpoint_dir: Path) -> Path:
