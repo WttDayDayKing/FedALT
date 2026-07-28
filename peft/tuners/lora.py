@@ -77,6 +77,10 @@ class LoraConfig(PeftConfig):
         default=True,
         metadata={"help": "If True, use 1 A and multiple B matrices. If False, use multiple A and B matrices."},
     )
+    use_router: bool = field(
+        default=True,
+        metadata={"help": "Use token-level routing when multiple LoRA adapters exist."},
+    )
 
     def __post_init__(self):
         self.peft_type = PeftType.LORA
@@ -114,6 +118,7 @@ class LoraModel(torch.nn.Module):
             "merge_weights": (self.peft_config.merge_weights or self.peft_config.inference_mode)
             and not is_hf_device_map_available,
             "asymmetric": self.peft_config.asymmetric,
+            "use_router": self.peft_config.use_router,
         }
 
         key_list = [key for key, _ in self.model.named_modules()]
@@ -186,6 +191,7 @@ class LoraModel(torch.nn.Module):
                         fan_in_fan_out=self.peft_config.fan_in_fan_out,
                         merge_weights=self.peft_config.merge_weights,
                         asymmetric=self.peft_config.asymmetric,
+                        use_router=self.peft_config.use_router,
                     )
 
                 self._replace_module(parent, target_name, new_module, target)
@@ -254,12 +260,14 @@ class Linear(nn.Linear, LoraLayer):
         fan_in_fan_out: bool = False,
         merge_weights: bool = True,
         asymmetric: bool = True,
+        use_router: bool = True,
         **kwargs,
     ):
         self.r = r
         self.lora_alpha = lora_alpha
         self.lora_num = lora_nums
         self.asymmetric = asymmetric
+        self.use_router = use_router
         self.fan_in_fan_out = fan_in_fan_out
 
         nn.Linear.__init__(self, in_features, out_features, **kwargs)
@@ -267,7 +275,7 @@ class Linear(nn.Linear, LoraLayer):
         LoraLayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, merge_weights=merge_weights)
 
         if r > 0:
-            if self.lora_num > 1:
+            if self.lora_num > 1 and self.use_router:
                 self.lora_route = nn.Linear(in_features, self.lora_num, bias=False)
             if self.asymmetric:
                 self.lora_A = nn.Linear(in_features, r, bias=False)
@@ -343,7 +351,7 @@ class Linear(nn.Linear, LoraLayer):
             result = F.linear(x, transpose(weight, self.fan_in_fan_out), bias=self.bias)
 
             if self.r > 0:
-                if self.lora_num > 1:
+                if self.lora_num > 1 and self.use_router:
                     route_logits = self.lora_route(x)
                     route_weight = nn.functional.softmax(route_logits, dim=-1, dtype=torch.float32).to(result.dtype)
                 else:
@@ -401,6 +409,7 @@ if _bnb_available:
             lora_nums: int = 2,
             lora_dropout: float = 0.0,
             asymmetric: bool = True,
+            use_router: bool = True,
             **kwargs,
         ):
             bnb.nn.Linear8bitLt.__init__(
@@ -416,8 +425,9 @@ if _bnb_available:
 
             self.lora_num = lora_nums
             self.asymmetric = asymmetric
+            self.use_router = use_router
             if r > 0:
-                if self.lora_num > 1:
+                if self.lora_num > 1 and self.use_router:
                     self.lora_route = nn.Linear(in_features, self.lora_num, bias=False)
                 if self.asymmetric:
                     self.lora_A = nn.Linear(in_features, r, bias=False)
@@ -459,7 +469,7 @@ if _bnb_available:
                     if x.dtype != torch.float32:
                         x = x.float()
 
-                    if self.lora_num > 1:
+                    if self.lora_num > 1 and self.use_router:
                         route_logits = self.lora_route(x)
                         route_weight = nn.functional.softmax(route_logits, dim=-1, dtype=torch.float32).to(expected_dtype)
                     else:
@@ -483,7 +493,7 @@ if _bnb_available:
                             result = result + (scaled_route if scaled_route is not None else 1.0) * lora_output * self.scaling
                     result = result.to(expected_dtype)
                 else:
-                    if self.lora_num > 1:
+                    if self.lora_num > 1 and self.use_router:
                         route_logits = self.lora_route(x)
                         route_weight = nn.functional.softmax(route_logits, dim=-1, dtype=torch.float32)
                     else:
@@ -524,6 +534,7 @@ if _bnb_available:
             lora_dropout: float = 0.0,
             enable_lora: List[bool] = [False],
             asymmetric: bool = True,
+            use_router: bool = True,
             **kwargs,
         ):
             bnb.nn.Linear8bitLt.__init__(
@@ -544,9 +555,10 @@ if _bnb_available:
             self.enable_lora = enable_lora
             self.lora_num = lora_nums
             self.asymmetric = asymmetric
+            self.use_router = use_router
 
             if r > 0 and any(enable_lora):
-                if self.lora_num > 1:
+                if self.lora_num > 1 and self.use_router:
                     self.lora_route = nn.Linear(in_features, self.lora_num, bias=False)
                 if self.asymmetric:
                     self.lora_A = nn.Linear(in_features, r * sum(enable_lora), bias=False)
@@ -610,7 +622,7 @@ if _bnb_available:
                     if x.dtype != torch.float32:
                         x = x.float()
 
-                    if self.lora_num > 1:
+                    if self.lora_num > 1 and self.use_router:
                         route_logits = self.lora_route(x)
                         route_weight = nn.functional.softmax(route_logits, dim=-1, dtype=torch.float32).to(expected_dtype)
                     else:
@@ -637,7 +649,7 @@ if _bnb_available:
                             result = result + (scaled_route if scaled_route is not None else 1.0) * output
                     result = result.to(expected_dtype)
                 else:
-                    if self.lora_num > 1:
+                    if self.lora_num > 1 and self.use_router:
                         route_logits = self.lora_route(x)
                         route_weight = nn.functional.softmax(route_logits, dim=-1, dtype=torch.float32)
                     else:

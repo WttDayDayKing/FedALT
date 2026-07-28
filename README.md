@@ -121,6 +121,96 @@ Each training launch writes a timestamped `training_config_*.json` alongside
 the checkpoints. It records the effective command, all arguments, working
 directory, and `CUDA_VISIBLE_DEVICES` for reproducibility.
 
+### FedDCR: data-function-aware dual LoRA
+
+Enable FedDCR explicitly; `--method` names the checkpoint directory and does
+not select the algorithm by itself:
+
+```bash
+python main.py \
+  --method feddcr \
+  --feddcr \
+  --lora_n 2 \
+  --rounds 20 \
+  --local_epochs 5 \
+  --client_num 8
+```
+
+FedDCR trains both adapters locally and does not create FedALT's token-level
+`lora_route`; the two LoRA outputs are added directly. Adapter 0 is the shared LoRA and is
+sample-count weighted on the server; adapter 1 and the token router remain
+client-specific in `checkpoints/<method>/private_states/`. Each client sends
+only its adapter-0 state plus a clipped, normalized CountSketch of its
+adapter-0 update. The server derives a weighted consensus direction and a
+client residual direction, which are used in the following round to assign
+each micro-batch a shared, private, or defer probability.
+
+The implementation uses micro-batch LoRA gradients as the practical proxy for
+per-example gradients. `--feddcr_learnability_weight`,
+`--feddcr_stability_weight`, and `--feddcr_conflict_variance_weight` control
+the learnability, EMA stability, and conflict terms. `--feddcr_clip_norm`
+sets the client-update clipping bound, and `--feddcr_score_history_size` sets
+the conflict-variance window.
+
+`infer.py --method feddcr` automatically reconstructs the same router-free
+adapter architecture; `--feddcr` is also available when using another
+checkpoint-directory name.
+
+FedDCR stores each round under `checkpoints/<method>/round_<n>/`. Evaluate a
+specific round by passing that directory; it contains the client-private
+adapter checkpoint and the matching shared aggregate:
+
+```bash
+python infer.py --method feddcr \
+  --checkpoint_dir ./results/flan1/checkpoints/feddcr/round_19
+```
+
+
+### FedCKD
+# E1：双 LoRA 参数空间
+--fedckd_routing_mode static \
+--fedckd_update_mode joint \
+--no-fedckd_persist_routing_statistics \
+--fedckd_aggregation uniform \
+--fedckd_warmup_steps 0 \
+--fedckd_orth_lambda 0 \
+--fedckd_prox_lambda 0
+
+# E2：加入交替更新
+# 在 E1 基础上仅改这一项
+--fedckd_update_mode alternating
+
+# E3：加入全局一致性评分
+# 在 E2 基础上仅改路由与评分权重
+--fedckd_routing_mode adaptive \
+--fedckd_alpha 1.0 \
+--fedckd_beta 0.0
+
+# E4：加入个性化增益
+--fedckd_alpha 0.5 \
+--fedckd_beta 0.5
+
+# E5：加入梯度响应，三项完整评分
+--fedckd_alpha 0.3333 \
+--fedckd_beta 0.3333
+
+# E6：加入首轮 warmup
+--fedckd_warmup_steps 20
+
+# E7：加入正交约束
+--fedckd_orth_lambda 1e-3
+
+# E8：加入近端约束
+--fedckd_prox_lambda 1e-3
+
+# E9：加入跨 round 评分统计
+--fedckd_persist_routing_statistics
+
+# E10：加入贡献加权聚合，即完整 FedCKD
+--fedckd_aggregation global_mass
+
+
+
 ### Multi-client, multi-GPU training
 
 `main.py` starts one worker process per selected GPU. Each worker keeps one

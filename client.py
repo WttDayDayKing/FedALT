@@ -20,14 +20,39 @@ from transformers import (
 from peft import LoraConfig, TaskType, get_peft_model
 from util import prepare_model_for_kbit_training, EvalDataset, write_file,set_lora_state_dict,get_lora_state_dict
 from feddcr import FedDCRTrainerMixin
+
+
 class FedDCRTrainer(FedDCRTrainerMixin, Trainer):
     pass
+
+
+def set_trainable_lora_parameters(model, lora_n: int, train_global: bool = False) -> None:
+    """Select the parameters owned by the current federated method.
+
+    ``lora_n == 1`` is the FedAvg baseline: the sole adapter (and its
+    optional route tensor) is trained and later averaged by the server.
+    Standard FedALT freezes adapter 0 and trains adapter 1 plus the route
+    network. FedDCR instead trains both adapters: its gradient-space router
+    assigns every micro-batch's update to the shared and/or private branch.
+    """
+    for name, parameter in model.named_parameters():
+        if lora_n == 1:
+            parameter.requires_grad = (
+                "lora_A0" in name or "lora_B0" in name or "lora_route" in name
+            )
+        else:
+            parameter.requires_grad = (
+                "lora_A1" in name or "lora_B1" in name or "lora_route" in name
+                or (train_global and ("lora_A0" in name or "lora_B0" in name))
+            )
+
+
 class Client:
     """Federated Learning Client with LoRA fine-tuning."""
     
     def __init__(self, client_id, client_dataset, tokenizer, prompter, model_name, device,
                  rank=8, lora_n=4, asymmetric=False, cache_path='/data/wtt/2026/FedALT/output',
-                 gradient_checkpointing=True):
+                 gradient_checkpointing=True, use_router=True):
         self.client_id = client_id
         self.client_dataset = client_dataset
         self.tokenizer = tokenizer
@@ -41,6 +66,7 @@ class Client:
         self.current_params = None
         self.device=device
         self.gradient_checkpointing = gradient_checkpointing
+        self.use_router = use_router
 
     def load_model(self):
         """Load model with quantization and LoRA configuration."""
@@ -77,6 +103,7 @@ class Client:
                 lora_dropout=0.05,
                 lora_nums=self.lora_n,
                 asymmetric=self.asymmetric,
+                use_router=self.use_router,
                 bias="none"
             )       
             
@@ -145,15 +172,9 @@ class Client:
         if global_state:
             set_lora_state_dict(model, global_state)
         model.train()
+        model.zero_grad(set_to_none=True)
         
-        # Only train local LoRA parameters
-        for name, param in model.named_parameters():
-            if 'lora_A1' in name or 'lora_B1' in name or 'lora_route' in name:
-                param.requires_grad = True
-            elif 'lora_A0' in name or 'lora_B0' in name:
-                param.requires_grad = True
-            else:  
-                param.requires_grad = False
+        set_trainable_lora_parameters(model, self.lora_n, train_global=bool(feddcr_config))
 
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         print(f"Number of trainable parameters: {len(trainable_params)}")
@@ -199,11 +220,19 @@ class Client:
                 global_prototype, local_prototype,
                 feddcr_config["sketch_dim"], feddcr_config["temperature"],
                 feddcr_config["residual_penalty"], feddcr_config["ema"],
+                feddcr_config["learnability_weight"], feddcr_config["stability_weight"],
+                feddcr_config["conflict_variance_weight"], feddcr_config["score_history_size"],
             )
         
         trainer.train()
 
-        client_stat=get_lora_state_dict(model)
+        client_stat = get_lora_state_dict(model)
+        nonfinite = [name for name, value in client_stat.items() if not torch.isfinite(value).all()]
+        if nonfinite:
+            raise FloatingPointError(
+                "FedDCR produced non-finite LoRA parameters; refusing to upload: "
+                + ", ".join(nonfinite[:5])
+            )
         route_metrics = trainer.feddcr_metrics() if feddcr_config else {}
 
         # Trainer retains references to optimizer and gradients.  Release them

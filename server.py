@@ -75,43 +75,52 @@ class Server:
 
     def train(self, clients_checkpoints: str) -> None:
         os.makedirs(clients_checkpoints, exist_ok=True)
+
         timing_file = os.path.join(clients_checkpoints, "round_timings.jsonl")
 
         for round_idx in range(self.args.rounds):
+            if self.args.feddcr:
+                self.args.feddcr_private_state_dir = os.path.join(clients_checkpoints, f"round_{round_idx}")
+                os.makedirs(self.args.feddcr_private_state_dir, exist_ok=True)
+
             round_started_at = time.perf_counter()
             print(f"\n--- FedAvg round {round_idx + 1}/{self.args.rounds} ---", flush=True)
             payloads = self._run_clients_parallel(self.client_ids, self.client_states)
             local_training_seconds = time.perf_counter() - round_started_at
             uploaded_states = {client_id: payload["state"] for client_id, payload in payloads.items()}
+            client_weights = [payloads[client_id]["num_examples"] for client_id in self.client_ids]
 
             aggregation_started_at = time.perf_counter()
-            for client_id, state in uploaded_states.items():
-                torch.save(state, os.path.join(clients_checkpoints, f"client_{client_id}.pt"))
-
             ordered_states = [uploaded_states[client_id] for client_id in self.client_ids]
-            # aggregated = (
-            #     self.aggregation(False, ordered_states)
-            #     if self.args.lora_n > 1
-            #     else self.aggregation_wtt(False, ordered_states)
-            # )
+            if self.args.lora_n == 1:
+                # Standard FedAvg: every client receives the same, sample
+                # count-weighted global LoRA state.
+                aggregated = self.aggregation_fedavg(ordered_states, client_weights)
+            elif self.args.feddcr:
+                aggregated = self.aggregation_feddcr(ordered_states, client_weights)
+            else:
+                aggregated = self.aggregation(False, ordered_states)
 
-            aggregated = (
-                self.aggregation_feddcr(ordered_states)
-                if self.args.feddcr else self.aggregation(False, ordered_states)
-                if self.args.lora_n > 1
-                else self.aggregation_wtt(False, ordered_states)
-            )
-
-            # FedALT aggregation only replaces the Rest-of-World adapter for
-            # lora_n > 1.  Keep each client's local adapter and router state.
+            # A FedDCR payload contains only adapter 0. Adapter 1 and the
+            # router stay in client-local storage and are never accepted by
+            # the server or used in an aggregation.
             self.client_states = {
                 client_id: self._merge_states(uploaded_states[client_id], aggregated[index])
                 for index, client_id in enumerate(self.client_ids)
             }
+            # Per-client checkpoints must contain both the private state and
+            # the global adapter downloaded for the next round, otherwise a
+            # direct per-client inference load misses frozen A0/B0 tensors.
+            if not self.args.feddcr:
+                for client_id, state in self.client_states.items():
+                    torch.save(state, os.path.join(clients_checkpoints, f"client_{client_id}.pt"))
 
             if self.args.feddcr:
                 sketches = {client_id: payload["sketch"] for client_id, payload in payloads.items()}
-                global_proto, local_protos = consensus_and_residuals(sketches)
+                global_proto, local_protos = consensus_and_residuals(
+                    sketches,
+                    {client_id: payloads[client_id]["num_examples"] for client_id in self.client_ids},
+                )
                 self.prototypes = {"global": global_proto, "local": local_protos}
                 metrics = {cid: payload["metrics"] for cid, payload in payloads.items()}
                 print(f"[FedDCR] route means: {metrics}", flush=True)
@@ -121,6 +130,13 @@ class Server:
                 [self.client_states[client_id] for client_id in self.client_ids],
                 os.path.join(clients_checkpoints, "global.pt"),
             )
+            if self.args.feddcr:
+                # Pair the private LoRA1 checkpoints written by the worker
+                # with the LoRA0 aggregate from this exact communication round.
+                torch.save(
+                    [self.client_states[client_id] for client_id in self.client_ids],
+                    os.path.join(self.args.feddcr_private_state_dir, "global.pt"),
+                )
             aggregation_seconds = time.perf_counter() - aggregation_started_at
             round_seconds = time.perf_counter() - round_started_at
             timing = {
@@ -252,30 +268,53 @@ class Server:
                     ).mean(dim=0).cpu()
         return aggregated_results
 
-    def aggregation_wtt(self, route_aggregation: bool, params: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.Tensor]]:
-        """Aggregate the shared A adapter while retaining the client's B adapter."""
-        if len(params) == 1:
-            return [{name: value.detach().cpu().clone() for name, value in params[0].items()}]
-        aggregated_results = [{} for _ in params]
-        for client_idx in range(len(params)):
-            for param_name in params[0]:
-                if "lora_route" in param_name:
-                    if route_aggregation:
-                        aggregated_results[client_idx][param_name] = torch.stack(
-                            [client[param_name] for client in params]
-                        ).mean(dim=0).cpu()
-                elif "lora_A" in param_name:
-                    aggregated_results[client_idx][param_name] = torch.stack(
-                        [client[param_name] for index, client in enumerate(params) if index != client_idx]
-                    ).mean(dim=0).cpu()
-                elif "lora_B" in param_name:
-                    aggregated_results[client_idx][param_name] = params[client_idx][param_name].detach().cpu().clone()
-        return aggregated_results
+    @staticmethod
+    def aggregation_fedavg(
+        params: List[Dict[str, torch.Tensor]], weights: List[int]
+    ) -> List[Dict[str, torch.Tensor]]:
+        """Compute one sample-count-weighted LoRA state for all FedAvg clients."""
+        if not params:
+            return []
+        if len(params) != len(weights):
+            raise ValueError("FedAvg needs one sample count for every client state.")
+        if any(weight <= 0 for weight in weights):
+            raise ValueError("FedAvg client sample counts must be positive.")
 
-    def aggregation_feddcr(self, params: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.Tensor]]:
-        """FedAvg adapter 0 globally; never aggregate adapter 1 or the router."""
+        total_weight = float(sum(weights))
+        global_state = {}
+        expected_names = set(params[0])
+        for client_idx, state in enumerate(params[1:], start=1):
+            if set(state) != expected_names:
+                raise ValueError(
+                    f"FedAvg client {client_idx} uploaded a different set of trainable tensors."
+                )
+        for name in params[0]:
+            reference = params[0][name]
+            aggregate = torch.zeros_like(reference, dtype=torch.float32, device="cpu")
+            for state, weight in zip(params, weights):
+                aggregate.add_(state[name].detach().to(dtype=torch.float32, device="cpu"), alpha=weight / total_weight)
+            global_state[name] = aggregate.to(dtype=reference.dtype)
+        return [{name: value.clone() for name, value in global_state.items()} for _ in params]
+
+    def aggregation_feddcr(
+        self, params: List[Dict[str, torch.Tensor]], weights: List[int]
+    ) -> List[Dict[str, torch.Tensor]]:
+        """Sample-weighted FedAvg of FedDCR's shared adapter 0 only."""
+        if not params:
+            return []
+        if len(params) != len(weights) or any(weight <= 0 for weight in weights):
+            raise ValueError("FedDCR needs one positive sample count for every client state.")
+
         shared = {}
         for name in params[0]:
             if "lora_A0" in name or "lora_B0" in name:
-                shared[name] = torch.stack([state[name] for state in params]).mean(0).cpu()
+                output_name = name
+                reference = params[0][name]
+                aggregate = torch.zeros_like(reference, dtype=torch.float32, device="cpu")
+                for state, weight in zip(params, weights):
+                    aggregate.add_(
+                        state[name].detach().to(dtype=torch.float32, device="cpu"),
+                        alpha=weight / float(sum(weights)),
+                    )
+                shared[output_name] = aggregate.to(dtype=reference.dtype)
         return [{name: value.clone() for name, value in shared.items()} for _ in params]

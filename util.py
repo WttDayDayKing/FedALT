@@ -70,6 +70,7 @@ def load_base_model(
     lora_n,
     device: torch.device = torch.device("cuda:0"),
     gradient_checkpointing: bool = True,
+    use_router: bool = True,
 ):
     # Accelerate validates 8-bit models against the process-local CUDA device.
     # A one-entry device map is the supported way to state that placement.
@@ -103,6 +104,7 @@ def load_base_model(
         lora_dropout=0.05,
         lora_nums=lora_n,
         asymmetric=False,
+        use_router=use_router,
         bias="none"
     )       
     

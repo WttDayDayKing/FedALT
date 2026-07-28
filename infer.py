@@ -1,13 +1,13 @@
 #!/usr/bin/env python
 # coding: utf-8
-"""Run FedALT inference and ROUGE evaluation from saved LoRA checkpoints."""
+"""Run federated LoRA inference and ROUGE evaluation from saved checkpoints."""
 
 import argparse
 import json
 import os
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional
 
 # Must be set before importing PyTorch.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -36,6 +36,7 @@ def parse_client_ids(value: str, client_num: int) -> List[int]:
 
 def default_checkpoint_path(args) -> Path:
     candidates = [
+        Path(args.result_dir) / args.dataset / "checkpoints" / args.method / "E1" / "global.pt",
         Path(args.result_dir) / args.dataset / "checkpoints" / args.method / "global.pt",
         # Compatibility with checkpoints produced by the earlier training entry point.
         Path(args.result_dir) / args.dataset / "checkpoints" / "method" / "global.pt",
@@ -51,6 +52,11 @@ def default_checkpoint_path(args) -> Path:
     )
 
 
+def method_uses_router(method: str, feddcr_compatibility_flag: bool = False) -> bool:
+    """Return whether inference must construct FedALT's token route module."""
+    return not (feddcr_compatibility_flag or method.lower() in {"feddcr", "fedckd"})
+
+
 def load_client_states(checkpoint_path: Path, client_ids: Iterable[int]) -> Dict[int, Dict[str, torch.Tensor]]:
     """Load either a global per-client checkpoint or one raw client state."""
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -62,7 +68,21 @@ def load_client_states(checkpoint_path: Path, client_ids: Iterable[int]) -> Dict
             raise ValueError(
                 f"Checkpoint contains {len(checkpoint)} client states, but requested clients {missing}."
             )
-        return {client_id: checkpoint[client_id] for client_id in client_ids}
+        states = {client_id: checkpoint[client_id] for client_id in client_ids}
+        # FedDCR checkpoints intentionally keep only adapter 0 in the
+        # server-owned global file. Complete each selected client state from
+        # its private adapter/router without treating it as a server upload.
+        if states and not any("lora_A1" in name or "lora_B1" in name for name in next(iter(states.values()))):
+            private_dir = checkpoint_path.parent / "private_states"
+            for client_id, state in states.items():
+                private_path = private_dir / f"client_{client_id}.pt"
+                if not private_path.is_file():
+                    raise FileNotFoundError(
+                        f"FedDCR private state for client {client_id} not found: {private_path}"
+                    )
+                private_state = torch.load(private_path, map_location="cpu")
+                states[client_id] = {**state, **private_state}
+        return states
 
     if isinstance(checkpoint, dict):
         # Historical client checkpoints are stored as {'client_id': ..., 'params': {...}}.
@@ -79,6 +99,29 @@ def load_client_states(checkpoint_path: Path, client_ids: Iterable[int]) -> Dict
     raise ValueError(f"Unsupported checkpoint type {type(checkpoint).__name__} in {checkpoint_path}.")
 
 
+def load_feddcr_round_state(global_path: Path, private_path: Path, client_id: int) -> Dict[str, torch.Tensor]:
+    """Combine the adapter-0 aggregate and adapter-1 state from one round."""
+    shared_states = torch.load(global_path, map_location="cpu")
+    if not isinstance(shared_states, list) or client_id >= len(shared_states):
+        raise ValueError(f"FedDCR round checkpoint has no shared state for client {client_id}: {global_path}")
+    private_state = torch.load(private_path, map_location="cpu")
+    if not isinstance(private_state, dict):
+        raise ValueError(f"FedDCR private checkpoint is not a state dict: {private_path}")
+    return {**shared_states[client_id], **private_state}
+
+
+def latest_round_directory(checkpoint_dir: Path) -> Optional[Path]:
+    """Return the numerically latest sibling ``round_<n>`` directory."""
+    rounds = []
+    for path in checkpoint_dir.parent.glob("round_*"):
+        if path.is_dir() and any(path.glob("client_*.pt")):
+            try:
+                rounds.append((int(path.name.removeprefix("round_")), path))
+            except ValueError:
+                continue
+    return max(rounds, default=(None, None))[1]
+
+
 def load_client_checkpoints(checkpoint_dir: Path, client_ids: Iterable[int]):
     """Load ``client_<id>.pt`` for each selected client from one directory."""
     if not checkpoint_dir.is_dir():
@@ -86,9 +129,45 @@ def load_client_checkpoints(checkpoint_dir: Path, client_ids: Iterable[int]):
 
     states = {}
     paths = {}
+    # FedDCR round directories contain adapter 1 and, from new runs onward,
+    # the matching adapter-0 aggregate. Never evaluate an adapter-1-only
+    # checkpoint as though it were a complete model.
+    feddcr_global_path = (
+        checkpoint_dir / "global.pt"
+        if checkpoint_dir.name.startswith("round_")
+        else checkpoint_dir.parent / "global.pt"
+        if checkpoint_dir.name == "private_states"
+        else None
+    )
+    # feddcr_global_path =checkpoint_dir.parent/"global.pt"
+    if (
+        checkpoint_dir.name.startswith("round_")
+        and feddcr_global_path is not None
+        and not feddcr_global_path.is_file()
+        and latest_round_directory(checkpoint_dir) == checkpoint_dir
+    ):
+        # Compatibility for historical runs that kept only the final shared
+        # aggregate at the checkpoint root.
+        root_global_path = checkpoint_dir.parent / "global.pt"
+        if root_global_path.is_file():
+            feddcr_global_path = root_global_path
     for client_id in client_ids:
         checkpoint_path = checkpoint_dir / f"client_{client_id}.pt"
+        if feddcr_global_path is not None and checkpoint_path.is_file():
+            if not feddcr_global_path.is_file():
+                raise FileNotFoundError(
+                    f"FedDCR round {checkpoint_dir} is missing its shared LoRA0 checkpoint: "
+                    f"{feddcr_global_path}"
+                )
+            states[client_id] = load_feddcr_round_state(feddcr_global_path, checkpoint_path, client_id)
+            paths[client_id] = f"{feddcr_global_path} + {checkpoint_path}"
+            continue
         if not checkpoint_path.is_file():
+            global_path = checkpoint_dir / "global.pt"
+            if global_path.is_file() and (checkpoint_dir / "private_states" / f"client_{client_id}.pt").is_file():
+                states[client_id] = load_client_states(global_path, [client_id])[client_id]
+                paths[client_id] = str(global_path)
+                continue
             raise FileNotFoundError(f"Client {client_id} checkpoint not found: {checkpoint_path}")
         states[client_id] = load_client_states(checkpoint_path, [client_id])[client_id]
         paths[client_id] = str(checkpoint_path)
@@ -184,18 +263,23 @@ def write_json(path: Path, value) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="FedALT inference and ROUGE evaluation")
+    parser = argparse.ArgumentParser(description="Federated LoRA inference and ROUGE evaluation")
     parser.add_argument("--model_name", type=str, default="/data/dataset/models/Llama-2-7b-hf")
     parser.add_argument("--data_path", type=str, default="/data/wtt/2026/FedDPA/data/dataset1")
     parser.add_argument("--result_dir", type=str, default="./results")
     parser.add_argument("--dataset", type=str, default="flan1")
-    parser.add_argument("--method", type=str, default="fedalt")
+    parser.add_argument(
+        "--method",
+        type=str,
+        default="fedckd",
+        choices=["fedalt", "fedavg", "feddcr", "fedckd"],
+    )
     parser.add_argument("--checkpoint_path", type=Path, default=None, help="global.pt or a single client_*.pt")
     parser.add_argument(
         "--checkpoint_dir",
         type=Path,
-        default="/data/wtt/2026/FedALT/results/flan1/checkpoints/fedalt",
-        help="Directory containing client_<id>.pt files; loads one checkpoint per selected client",
+        default="./results/flan1/checkpoints/fedckd/E1",
+        help="Client checkpoint directory; for FedCKD this must contain global.pt",
     )
     parser.add_argument("--client_num", type=int, default=8)
     parser.add_argument("--client_ids", type=str, default="all", help="'all' or comma-separated IDs")
@@ -203,8 +287,13 @@ def main():
     parser.add_argument("--output_dir", type=Path, default=None, help="Defaults to <result_dir>/<dataset>/eval/<method>")
     parser.add_argument("--run_name", type=str, default=None, help="Name used in prediction and score filenames")
     parser.add_argument("--rank", type=int, default=8)
-    parser.add_argument("--lora_n", type=int, default=1)
-    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--lora_n", type=int, default=2)
+    parser.add_argument("--lora_alpha", type=int, default=16)
+    parser.add_argument(
+        "--feddcr",
+        action="store_true",
+        help="Compatibility flag: load a router-free dual-LoRA model",
+    )
     parser.add_argument("--gpu_id", type=int, default=0, help="Visible CUDA device used for inference")
     parser.add_argument("--eval_batch_size", type=int, default=1)
     parser.add_argument("--max_input_length", type=int, default=512)
@@ -223,8 +312,18 @@ def main():
     if args.checkpoint_path and args.checkpoint_dir:
         raise ValueError("Use either --checkpoint_path or --checkpoint_dir, not both.")
     if args.checkpoint_dir:
-        client_states, checkpoint_description = load_client_checkpoints(args.checkpoint_dir, client_ids)
-        default_run_name = "client_checkpoints"
+        if args.method.lower() == "fedckd":
+            checkpoint_path = args.checkpoint_dir / "global.pt"
+            if not checkpoint_path.is_file():
+                raise FileNotFoundError(
+                    f"FedCKD requires the post-aggregation checkpoint: {checkpoint_path}"
+                )
+            client_states = load_client_states(checkpoint_path, client_ids)
+            checkpoint_description = str(checkpoint_path)
+            default_run_name = checkpoint_path.stem
+        else:
+            client_states, checkpoint_description = load_client_checkpoints(args.checkpoint_dir, client_ids)
+            default_run_name = "client_checkpoints"
     else:
         checkpoint_path = args.checkpoint_path or default_checkpoint_path(args)
         if not checkpoint_path.is_file():
@@ -245,6 +344,7 @@ def main():
         args.lora_n,
         device=device,
         gradient_checkpointing=False,
+        use_router=method_uses_router(args.method, args.feddcr),
     )
     prompter = Prompter("alpaca_short")
     summary = {"checkpoint": checkpoint_description, "clients": {}}
